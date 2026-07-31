@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+# Unlike roost -- which had to become roost-top because PyPI holds "roost" in
+# reserve -- the bare name is free here (checked: git-roost, git_roost and
+# gitroost all 404 on PyPI). So the distribution, the command, the module, the
+# repo, the formula and the .deb are all git-roost, with no aliasing to explain.
+name = "git-roost"
+dynamic = ["version"]
+description = "top for git -- every repo and worktree on the box, most actionable first"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "George M. Howard", email = "dev@swamplink.com" }]
+keywords = ["git", "tui", "top", "monitoring", "worktree", "repos", "dashboard"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: System :: Monitoring",
+]
+# No dependencies, and there will not be any: git-roost has to run on whatever
+# Python is already on the box, including a bare system 3.9 on macOS.
+dependencies = []
+
+# Deliberately no [project.urls] yet -- the repo has no remote. Adding a
+# Homepage that 404s is worse than omitting it, and PyPI renders it verbatim.
+# Restore the Homepage/Issues pair from roost's pyproject once the remote exists.
+
+[project.scripts]
+git-roost = "git_roost:main"
+
+# One source of truth for the version: __version__ in git_roost.py, which is
+# also what `git-roost --version` prints and what the man page header carries.
+# packaging/check-version-consistency.sh enforces that they agree -- roost
+# shipped a v0.3 whose man page and Homebrew formula still said 0.2, because
+# nothing checked the artifacts that embed the version as literal text.
+[tool.hatch.version]
+path = "git_roost.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["git_roost.py"]
+
+# Installs to <prefix>/share/man/man1. pipx and venv installs put that outside
+# the default MANPATH, so `man git-roost` works after a system or Homebrew
+# install but may need MANPATH help inside a venv -- see README.
+[tool.hatch.build.targets.wheel.shared-data]
+"git-roost.1" = "share/man/man1/git-roost.1"
+
+[tool.hatch.build.targets.sdist]
+include = ["git_roost.py", "git-roost.1", "README.md", "LICENSE", "tests/", "packaging/"]

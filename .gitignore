@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Build output: `python -m build` writes dist/, packaging/build-deb.sh writes
+# the .deb there too. Both are reproducible from the tag; neither belongs here.
+dist/
+build/
+*.egg-info/
+*.deb
