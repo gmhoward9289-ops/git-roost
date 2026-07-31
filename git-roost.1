@@ -17,9 +17,14 @@ which reports on Claude Code sessions. Sessions report what they intend to do;
 git reports what actually happened.
 .PP
 .B git\-roost
-is read\-only by construction: every git invocation is checked against a
-whitelist of read\-only plumbing subcommands and raises otherwise, so the tool
-cannot modify a working tree, an index or a ref.
+is read\-only by construction: every git invocation is checked against an
+allowlist of read\-only plumbing and raises otherwise, so the tool cannot modify
+a working tree, an index or a ref. The allowlist is keyed on the subcommand and
+its first argument together, since
+.B stash list
+and
+.B stash pop
+are not the same kind of operation.
 .SH OPTIONS
 .TP
 .BR \-w ", " \-\-watch " [\fISECS\fR]"
@@ -29,6 +34,9 @@ Redraw every \fISECS\fR seconds, default 3.
 Show a commit feed merged across every repository, newest first, default 25
 entries. Commits are deduplicated per repository, so a repo and its worktrees do
 not each contribute a copy.
+.TP
+.BR \-1 ", " \-\-once
+Render once and exit. This is the default; it overrides \fB\-\-watch\fR.
 .TP
 .BR \-a ", " \-\-all
 Expand the collapsed QUIET group.
@@ -58,6 +66,11 @@ or both. Untracked files are marked but never promoted to the UNCOMMITTED group.
 Position against the base branch: \fB=\fR in sync, \fB^N\fR ahead, \fBvN\fR
 behind, \fB^NvM\fR diverged, \fB\-\fR unknown. A dash means unknown, never in
 sync.
+.IP
+The baseline is the branch's upstream if it has one, else \fBorigin/HEAD\fR,
+else \(em when the repository has exactly one remote \(em that remote's
+\fBHEAD\fR, \fBmain\fR or \fBmaster\fR. With two or more remotes and no
+\fBorigin/HEAD\fR the baseline is reported as unknown rather than guessed.
 .TP
 .B STASH
 Number of stash entries, blank when there are none.

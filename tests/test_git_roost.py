@@ -73,7 +73,41 @@ class TestReadOnlyGuard(unittest.TestCase):
         forbidden = {"commit", "checkout", "push", "fetch", "pull", "reset",
                      "clean", "merge", "rebase", "add", "rm", "gc", "prune",
                      "switch", "restore", "cherry-pick", "revert", "apply"}
-        self.assertEqual(forbidden & git_roost.READ_ONLY, set())
+        self.assertEqual(forbidden & set(git_roost.READ_ONLY), set())
+
+    def test_dangerous_forms_of_permitted_subcommands_are_refused(self):
+        # The subcommand alone does not settle it. Every pair below shares its
+        # first word with a legitimate read-only call, and each of these three
+        # slipped through a subcommand-level allowlist: stash pop mutates the
+        # working tree, stash clear destroys data, config <k> <v> writes
+        # .git/config, and symbolic-ref with a value rewrites HEAD.
+        refused = [
+            ("stash", "pop"),
+            ("stash", "clear"),
+            ("stash", "drop"),
+            ("stash", "push"),
+            ("stash",),
+            ("config", "user.email", "evil@example.com"),
+            ("config", "--unset", "user.email"),
+            ("config",),
+            ("symbolic-ref", "HEAD", "refs/heads/other"),
+            ("remote", "add", "evil", "https://example.com"),
+            ("remote", "remove", "origin"),
+        ]
+        for args in refused:
+            with self.assertRaises(git_roost.NotReadOnly, msg=" ".join(args)):
+                git_roost.git("/tmp", *args)
+
+    def test_safe_forms_of_those_subcommands_are_permitted(self):
+        for args in [
+            ("stash", "list"),
+            ("config", "--get", "user.email"),
+            ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"),
+            ("remote",),
+            ("rev-parse", "--show-toplevel"),
+            ("log", "-1"),
+        ]:
+            git_roost.check_read_only(args)  # must not raise
 
     @needs_git
     def test_reading_a_repo_leaves_it_untouched(self):
@@ -332,6 +366,51 @@ class TestTreeState(unittest.TestCase):
             self.assertEqual(st["operation"], "merge")
             self.assertGreaterEqual(st["conflicts"], 1)
             self.assertEqual(git_roost.bucket(st)[1], "MID-OPERATION")
+
+    @needs_git
+    def test_drift_is_found_when_the_only_remote_is_not_called_origin(self):
+        # ~/GitHub/blog and its worktrees have exactly one remote, named
+        # "deploy". An origin-only lookup rendered a tree nine commits behind as
+        # "-" and filed it under QUIET.
+        with tempfile.TemporaryDirectory() as tmp:
+            upstream = make_repo(Path(tmp) / "up")
+            clone = Path(tmp) / "clone"
+            subprocess.run(
+                ("git", "clone", "--origin", "deploy", str(upstream), str(clone)),
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            run(clone, "config", "user.name", "Test")
+            run(clone, "config", "user.email", "test@example.com")
+            # Move the remote ahead, then drop the local upstream link so the
+            # only route to a baseline is the remote-name fallback.
+            (upstream / "next.txt").write_text("x\n")
+            run(upstream, "add", "next.txt")
+            run(upstream, "commit", "-m", "second")
+            run(clone, "fetch", "deploy")
+            run(clone, "branch", "--unset-upstream")
+
+            st = git_roost.tree_state(clone)
+            self.assertTrue(st["base"], "no baseline found for a non-origin remote")
+            self.assertEqual(st["behind"], 1)
+            self.assertEqual(git_roost.bucket(st)[1], "BEHIND")
+
+    @needs_git
+    def test_two_remotes_without_origin_head_render_unknown_not_a_guess(self):
+        # A confident wrong baseline is worse than admitting we do not know.
+        with tempfile.TemporaryDirectory() as tmp:
+            upstream = make_repo(Path(tmp) / "up")
+            other = make_repo(Path(tmp) / "other")
+            clone = Path(tmp) / "clone"
+            subprocess.run(
+                ("git", "clone", "--origin", "deploy", str(upstream), str(clone)),
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            run(clone, "remote", "add", "backup", str(other))
+            run(clone, "branch", "--unset-upstream")
+
+            st = git_roost.tree_state(clone)
+            self.assertEqual(st["base"], "")
+            self.assertEqual(git_roost.drift(st), "-")
 
     @needs_git
     def test_not_a_repo_returns_none(self):

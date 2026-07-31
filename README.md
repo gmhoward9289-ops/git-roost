@@ -43,6 +43,7 @@ more than one thing is working in parallel.
 
 ```bash
 git-roost                # one table, most actionable first
+git-roost -1             # render once and exit (the default; --once)
 git-roost -w             # redraw every 3s (the top view)
 git-roost --log          # commit feed across every repo, newest first
 git-roost --all          # expand the QUIET group
@@ -75,18 +76,41 @@ Columns:
 - **STASH** — stash entries, blank when there are none.
 - **LAST** — age of the last commit.
 
-Drift compares against the branch's upstream when it has one, and falls back to
-`origin/HEAD` when it does not. That fallback is the whole point: branches that
-are never pushed have no upstream, and an upstream-only check reports every one
-of them as clean.
+### Finding the baseline
+
+Drift needs something to measure against. The chain is:
+
+1. the branch's own upstream, when it has one;
+2. `origin/HEAD`;
+3. if the repo has exactly **one** remote, that remote's `HEAD`, then its
+   `main` or `master`;
+4. otherwise `-`.
+
+Steps 1 and 2 are the ones that matter most and are also the easiest to get
+wrong in opposite directions. Branches that are never pushed have no upstream,
+so an upstream-only check calls every one of them clean. And `origin` is a
+convention, not a guarantee — one repo here has a single remote named `deploy`,
+and an origin-only lookup filed a tree that was nine commits behind under QUIET.
+
+Step 3 stops at a single remote on purpose. With two remotes there is no way to
+know which is authoritative, and a confident wrong baseline is worse than `-`.
 
 ## Read-only by construction
 
-Every git invocation goes through one function that refuses any subcommand
-outside a whitelist of read-only plumbing. It cannot mutate a tree, an index or
-a ref — not because it happens not to, but because the call raises. The test
-suite asserts the whitelist, and asserts that reading a repo leaves its status
-and `HEAD` byte-identical.
+Every git invocation goes through one function that refuses anything outside an
+allowlist of read-only plumbing. It cannot mutate a tree, an index or a ref —
+not because it happens not to, but because the call raises.
+
+The allowlist is keyed on `(subcommand, first argument)`, not the subcommand
+alone, because the subcommand alone does not settle it: `stash list` reports but
+`stash pop` mutates and `stash clear` destroys; `config --get` reads but
+`config <key> <value>` writes; `symbolic-ref --short REF` reads but
+`symbolic-ref HEAD REF` rewrites `HEAD`. A subcommand-level allowlist admits all
+of those writes, and an earlier version of this file did.
+
+The test suite asserts the policy directly, asserts each of those dangerous
+forms is refused, and asserts that reading a repo leaves its status and `HEAD`
+byte-identical.
 
 This matters because the tool is meant to sit in a watch loop over every repo on
 the machine, unattended.

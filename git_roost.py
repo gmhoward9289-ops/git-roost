@@ -22,9 +22,10 @@ constraints as roost, for the same reason: it has to run on whatever Python is
 already on the box, including a bare system 3.9 on macOS.
 
 Read-only by construction. Every git invocation goes through git(), which
-refuses any subcommand outside READ_ONLY -- so the tool cannot mutate a tree, an
-index or a ref even if a future edit tries to. tests/test_git_roost.py asserts
-that whitelist holds.
+refuses anything outside READ_ONLY -- so the tool cannot mutate a tree, an index
+or a ref even if a future edit tries to. The allowlist is keyed on the
+subcommand *and* its first argument, because `stash list` and `stash pop` are
+not the same kind of thing. tests/test_git_roost.py asserts that policy directly.
 """
 
 from __future__ import annotations
@@ -139,17 +140,52 @@ def dur(secs):
 
 # ---------------------------------------------------------------- git plumbing
 
-# Every subcommand this tool is allowed to run. All of them are read-only: they
-# report, they do not touch the index, the worktree or any ref. Anything not
-# listed raises rather than running -- the guarantee in the module docstring is
-# only worth something if it is enforced somewhere.
-READ_ONLY = frozenset((
-    "rev-parse", "status", "rev-list", "log", "stash", "config", "symbolic-ref",
-))
+# What this tool is allowed to run, as (subcommand -> permitted first argument).
+# None means the subcommand cannot write whatever its arguments; a set means only
+# those forms are read-only and everything else is refused.
+#
+# Checking the subcommand alone is not enough, which is the whole reason this is
+# a mapping: `stash list` reports but `stash pop` mutates the working tree and
+# `stash clear` destroys data; `config --get` reads but `config user.email x`
+# writes .git/config; `symbolic-ref --short REF` reads but `symbolic-ref HEAD REF`
+# rewrites HEAD. A subcommand-level allowlist admits all three of the writes.
+# "" is the entry for a bare invocation with no arguments at all.
+READ_ONLY = {
+    "rev-parse": None,
+    "rev-list": None,
+    "log": None,
+    "status": None,
+    "stash": frozenset(("list", "show")),
+    "config": frozenset(("--get", "--get-all", "--list")),
+    "symbolic-ref": frozenset(("--short",)),
+    "remote": frozenset(("",)),
+}
 
 
 class NotReadOnly(RuntimeError):
-    """Raised when a caller asks git() for a subcommand that could write."""
+    """Raised when a caller asks git() for anything that could write."""
+
+
+def check_read_only(args):
+    """Raise unless args is a form that cannot modify a repository.
+
+    Split out from git() so the test suite can assert the policy directly rather
+    than by observing side effects it hopes do not happen.
+    """
+    if not args:
+        raise NotReadOnly("git-roost refuses an empty git invocation")
+    sub = args[0]
+    if sub not in READ_ONLY:
+        raise NotReadOnly("git-roost refuses non-read-only subcommand: %r" % sub)
+    allowed = READ_ONLY[sub]
+    if allowed is None:
+        return
+    first = args[1] if len(args) > 1 else ""
+    if first not in allowed:
+        raise NotReadOnly(
+            "git-roost refuses %r: only %s are read-only"
+            % (" ".join(args[:2]), ", ".join(sorted(a or "(no args)" for a in allowed)))
+        )
 
 
 def git(dirpath, *args):
@@ -159,8 +195,7 @@ def git(dirpath, *args):
     and the call. None of that is worth an exception: the row just shows what it
     could learn and dashes for the rest.
     """
-    if not args or args[0] not in READ_ONLY:
-        raise NotReadOnly("git-roost refuses non-read-only subcommand: %r" % (args[:1],))
+    check_read_only(args)
     try:
         out = subprocess.run(
             ("git", "-C", str(dirpath)) + tuple(args),
@@ -309,16 +344,48 @@ def repo_facts(path, common_dir):
     if hit is not None:
         return hit
 
-    facts = {"stashes": 0, "origin_head": ""}
+    facts = {"stashes": 0, "base": ""}
     stashes = git(path, "stash", "list")
     if stashes:
         facts["stashes"] = len([ln for ln in stashes.splitlines() if ln])
-    head = git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-    facts["origin_head"] = head or ""
+    facts["base"] = resolve_base(path)
 
     with _repo_lock:
         _repo_cache.setdefault(key, facts)
     return facts
+
+
+def resolve_base(path):
+    """The remote branch to measure drift against when there is no upstream.
+
+    "origin" is a convention, not a guarantee. ~/GitHub/blog and its worktrees
+    have exactly one remote and it is called "deploy": an origin-only lookup
+    finds nothing, renders "-", and files a tree that is nine commits behind
+    under QUIET. That is the 2026-07-30 false-clean one level down -- not
+    "upstream-only" that time, but "origin-only" this time.
+
+    Stops at a single remote deliberately. With two remotes, guessing which one
+    is authoritative is worse than admitting we do not know: a confident wrong
+    baseline is the failure this whole chain exists to avoid.
+    """
+    head = git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if head:
+        return head
+
+    remotes = (git(path, "remote") or "").split()
+    if len(remotes) != 1:
+        return ""
+    remote = remotes[0]
+
+    head = git(path, "symbolic-ref", "--short", "refs/remotes/%s/HEAD" % remote)
+    if head:
+        return head
+    for name in ("main", "master"):
+        ref = "%s/%s" % (remote, name)
+        if git(path, "rev-parse", "--verify", "--quiet",
+               "refs/remotes/%s" % ref) is not None:
+            return ref
+    return ""
 
 
 def tree_state(path):
@@ -375,11 +442,12 @@ def tree_state(path):
         st["branch"] = git(path, "rev-parse", "--short", "HEAD") or "?"
 
     # status --branch already gave ahead/behind when the branch has an upstream.
-    # When it has none, fall back to origin/HEAD: ccwork branches are never
-    # pushed, so an upstream-only check calls them all clean -- on 2026-07-30
-    # that reported all 8 drifted counting-chicken-wings worktrees as current.
-    if not st["base"] and facts["origin_head"]:
-        st["base"] = facts["origin_head"]
+    # When it has none, fall back to the repo's default remote branch: ccwork
+    # branches are never pushed, so an upstream-only check calls them all clean
+    # -- on 2026-07-30 that reported all 8 drifted counting-chicken-wings
+    # worktrees as current.
+    if not st["base"] and facts["base"]:
+        st["base"] = facts["base"]
         counts = git(path, "rev-list", "--left-right", "--count",
                      "HEAD...%s" % st["base"])
         if counts:
@@ -657,6 +725,8 @@ def main(argv=None):
     ap.add_argument("--version", action="version", version="git-roost %s" % __version__)
     ap.add_argument("-w", "--watch", nargs="?", const=3.0, type=float, metavar="SECS",
                     help="redraw every SECS seconds (default 3)")
+    ap.add_argument("-1", "--once", action="store_true",
+                    help="render once and exit (the default; overrides --watch)")
     ap.add_argument("--log", nargs="?", const=25, type=int, metavar="N",
                     help="commit feed across every repo, newest first (default 25)")
     ap.add_argument("-a", "--all", action="store_true", help="expand the QUIET group")
@@ -668,18 +738,21 @@ def main(argv=None):
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
     args = ap.parse_args(argv)
 
-    # Colour needs escape support and a real terminal. NO_COLOR is the community
-    # convention (https://no-color.org) and costs nothing to honour.
-    COLOR = (
-        not args.no_color
-        and not os.environ.get("NO_COLOR")
-        and sys.stdout.isatty()
-        and enable_windows_ansi()
-    )
+    # Escape sequences need a real terminal that understands them. This gates
+    # the watch loop's cursor-home and erase as well as colour: on a Windows
+    # console without VT processing those two are ignored rather than obeyed, so
+    # every frame appends below the last and the screen pages away instead of
+    # redrawing. Piping to a file has the same problem in a different form.
+    ansi = sys.stdout.isatty() and enable_windows_ansi()
+
+    # NO_COLOR is the community convention (https://no-color.org) and costs
+    # nothing to honour. It suppresses colour only -- a user who wants plain
+    # output still wants watch mode to redraw in place.
+    COLOR = ansi and not args.no_color and not os.environ.get("NO_COLOR")
     if args.json:
         COLOR = False
 
-    if not args.watch:
+    if args.once or not args.watch:
         width = shutil.get_terminal_size((160, 24)).columns
         print("\n".join(body(args, width)))
         return 0
@@ -688,7 +761,11 @@ def main(argv=None):
         while True:
             width = shutil.get_terminal_size((160, 24)).columns
             out = body(args, width)
-            sys.stdout.write("\033[H\033[2J")
+            if ansi:
+                sys.stdout.write("\033[H\033[2J")
+            else:
+                # No VT support: a rule beats escape codes printed literally.
+                sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
             sys.stdout.write(time.strftime("git-roost  %H:%M:%S") + "\n\n")
             sys.stdout.write("\n".join(out) + "\n")
             sys.stdout.flush()
