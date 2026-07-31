@@ -98,6 +98,39 @@ class TestReadOnlyGuard(unittest.TestCase):
             with self.assertRaises(git_roost.NotReadOnly, msg=" ".join(args)):
                 git_roost.git("/tmp", *args)
 
+    def test_a_leading_safe_flag_does_not_launder_a_write(self):
+        # Checking the first argument alone is not enough either. Each of these
+        # opens with a token the allowlist accepts and then writes anyway:
+        # `symbolic-ref --short HEAD <ref>` rewrites HEAD -- verified doing
+        # exactly that against a scratch repo -- and a config scope flag shifts
+        # the key and value one position right, past a fixed-position check.
+        for args in [
+            ("symbolic-ref", "--short", "HEAD", "refs/heads/other"),
+            ("config", "--local", "core.hooksPath", "/tmp"),
+            ("config", "--global", "user.email", "evil@example.com"),
+            ("config", "--get", "core.hooksPath", "/tmp"),
+        ]:
+            with self.assertRaises(git_roost.NotReadOnly, msg=" ".join(args)):
+                git_roost.git("/tmp", *args)
+
+    @needs_git
+    def test_symbolic_ref_write_form_is_refused_in_practice(self):
+        # The regression this encodes: the write form left HEAD pointing at a
+        # different branch with no working-tree change at all, so nothing
+        # downstream would have noticed.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            before = subprocess.run(
+                ("git", "symbolic-ref", "HEAD"), cwd=str(repo),
+                capture_output=True, text=True).stdout.strip()
+            with self.assertRaises(git_roost.NotReadOnly):
+                git_roost.git(repo, "symbolic-ref", "--short", "HEAD",
+                              "refs/heads/other")
+            after = subprocess.run(
+                ("git", "symbolic-ref", "HEAD"), cwd=str(repo),
+                capture_output=True, text=True).stdout.strip()
+            self.assertEqual(before, after)
+
     def test_safe_forms_of_those_subcommands_are_permitted(self):
         for args in [
             ("stash", "list"),

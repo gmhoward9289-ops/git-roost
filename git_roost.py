@@ -140,25 +140,38 @@ def dur(secs):
 
 # ---------------------------------------------------------------- git plumbing
 
-# What this tool is allowed to run, as (subcommand -> permitted first argument).
-# None means the subcommand cannot write whatever its arguments; a set means only
-# those forms are read-only and everything else is refused.
+# What this tool is allowed to run: subcommand -> None, or a rule pairing the
+# permitted first argument with the most positional arguments a read-only form
+# of that subcommand can take. None means the subcommand cannot write whatever
+# its arguments.
 #
-# Checking the subcommand alone is not enough, which is the whole reason this is
-# a mapping: `stash list` reports but `stash pop` mutates the working tree and
-# `stash clear` destroys data; `config --get` reads but `config user.email x`
-# writes .git/config; `symbolic-ref --short REF` reads but `symbolic-ref HEAD REF`
-# rewrites HEAD. A subcommand-level allowlist admits all three of the writes.
+# Checking the subcommand alone is not enough: `stash list` reports but `stash
+# pop` mutates the working tree and `stash clear` destroys data; `config --get`
+# reads but `config user.email x` writes .git/config.
+#
+# Checking the first argument alone is *also* not enough, which is why the
+# positional cap exists. A leading flag does not make the rest of the line safe:
+#
+#     git symbolic-ref --short HEAD refs/heads/other
+#
+# passes a first-argument check on "--short" and rewrites HEAD -- verified doing
+# exactly that. The read form takes one positional (the ref to resolve); the
+# write form takes two (the ref, and what to point it at). Counting them is what
+# separates the two, since git accepts the flag in either. The same shape is why
+# `config --local core.hooksPath /tmp` has to be refused: a scope flag shifts the
+# key and value one position right, and hooksPath is per-repo, not per-worktree,
+# so it would reach every worktree and every session in them.
+#
 # "" is the entry for a bare invocation with no arguments at all.
 READ_ONLY = {
     "rev-parse": None,
     "rev-list": None,
     "log": None,
     "status": None,
-    "stash": frozenset(("list", "show")),
-    "config": frozenset(("--get", "--get-all", "--list")),
-    "symbolic-ref": frozenset(("--short",)),
-    "remote": frozenset(("",)),
+    "stash": (frozenset(("list", "show")), 2),
+    "config": (frozenset(("--get", "--get-all", "--list")), 1),
+    "symbolic-ref": (frozenset(("--short",)), 1),
+    "remote": (frozenset(("",)), 0),
 }
 
 
@@ -177,14 +190,26 @@ def check_read_only(args):
     sub = args[0]
     if sub not in READ_ONLY:
         raise NotReadOnly("git-roost refuses non-read-only subcommand: %r" % sub)
-    allowed = READ_ONLY[sub]
-    if allowed is None:
+    rule = READ_ONLY[sub]
+    if rule is None:
         return
+    allowed, max_positional = rule
+
     first = args[1] if len(args) > 1 else ""
     if first not in allowed:
         raise NotReadOnly(
             "git-roost refuses %r: only %s are read-only"
             % (" ".join(args[:2]), ", ".join(sorted(a or "(no args)" for a in allowed)))
+        )
+
+    # Fails closed: an unrecognised flag that takes a value would make its value
+    # look positional and push the count over, refusing a call rather than
+    # letting an unexamined form through.
+    positional = [a for a in args[1:] if not a.startswith("-")]
+    if len(positional) > max_positional:
+        raise NotReadOnly(
+            "git-roost refuses %r: %d positional argument(s), read-only %s takes "
+            "at most %d" % (" ".join(args), len(positional), sub, max_positional)
         )
 
 
