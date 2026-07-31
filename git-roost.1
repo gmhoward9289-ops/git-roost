@@ -1,0 +1,84 @@
+.TH GIT-ROOST 1 "2026-07-31" "git-roost 0.1" "User Commands"
+.SH NAME
+git\-roost \- top for git, across every repo and worktree on the box
+.SH SYNOPSIS
+.B git\-roost
+.RI [ options ]
+.SH DESCRIPTION
+.B git\-roost
+shows every git working tree it can find in one table, grouped by what it costs
+to ignore: trees stuck part\-way through a rebase or merge first, then diverged
+trees, then uncommitted work, then unpushed commits, then trees that have fallen
+behind.
+.PP
+It is a companion to
+.BR roost (1),
+which reports on Claude Code sessions. Sessions report what they intend to do;
+git reports what actually happened.
+.PP
+.B git\-roost
+is read\-only by construction: every git invocation is checked against a
+whitelist of read\-only plumbing subcommands and raises otherwise, so the tool
+cannot modify a working tree, an index or a ref.
+.SH OPTIONS
+.TP
+.BR \-w ", " \-\-watch " [\fISECS\fR]"
+Redraw every \fISECS\fR seconds, default 3.
+.TP
+.BR \-\-log " [\fIN\fR]"
+Show a commit feed merged across every repository, newest first, default 25
+entries. Commits are deduplicated per repository, so a repo and its worktrees do
+not each contribute a copy.
+.TP
+.BR \-a ", " \-\-all
+Expand the collapsed QUIET group.
+.TP
+.BR \-\-root " \fIDIR\fR"
+Where to look for repositories. Repeatable. Defaults to ~/GitHub.
+.TP
+.BR \-\-depth " \fIN\fR"
+How deep to search below each root, default 3. Worktrees kept beside a repo live
+at <root>/.worktrees/<repo>/<slug>, which is depth 3.
+.TP
+.B \-\-json
+Emit the collected records as JSON rather than a table.
+.TP
+.B \-\-no\-color
+Disable colour output.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH COLUMNS
+.TP
+.B WORK
+Uncommitted work: \fBclean\fR, a count of tracked changes, \fB+N?\fR untracked,
+or both. Untracked files are marked but never promoted to the UNCOMMITTED group.
+.TP
+.B DRIFT
+Position against the base branch: \fB=\fR in sync, \fB^N\fR ahead, \fBvN\fR
+behind, \fB^NvM\fR diverged, \fB\-\fR unknown. A dash means unknown, never in
+sync.
+.TP
+.B STASH
+Number of stash entries, blank when there are none.
+.TP
+.B LAST
+Age of the most recent commit.
+.SH ENVIRONMENT
+.TP
+.B GIT_ROOST_WORKERS
+Size of the thread pool used to scan trees. Default 12.
+.TP
+.B GIT_ROOST_TIMEOUT
+Seconds before an individual git call is abandoned. Default 5.
+.TP
+.B NO_COLOR
+If set, colour output is disabled. See https://no-color.org.
+.SH EXIT STATUS
+Returns 0 on success, including when no repositories are found.
+.SH SEE ALSO
+.BR roost (1),
+.BR git\-status (1),
+.BR git\-worktree (1)
+.SH AUTHOR
+George M. Howard <dev@swamplink.com>

@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""git-roost -- top for git, across every repo and worktree on the box.
+
+roost answers "what are my Claude sessions doing". git-roost answers the other
+half: what the trees they are working in actually contain. Sessions report what
+they intend to do; git reports what happened, and only one of those two can be
+wrong.
+
+Single-repo TUIs already exist and are good -- lazygit, gitui, tig. None of them
+answer a question about thirty trees at once, which is exactly the question you
+have when a dozen agents are working in parallel: who is diverged, who has
+uncommitted work nobody has looked at, who is stuck mid-rebase.
+
+    git-roost                # one table, most actionable first
+    git-roost -w             # redraw every 3s (the top view)
+    git-roost --log          # commit feed across every repo, newest first
+    git-roost --all          # expand the QUIET group
+    git-roost --json         # records, for piping somewhere else
+
+One file, no dependencies, Python 3.9+, macOS/Linux/Windows -- the same
+constraints as roost, for the same reason: it has to run on whatever Python is
+already on the box, including a bare system 3.9 on macOS.
+
+Read-only by construction. Every git invocation goes through git(), which
+refuses any subcommand outside READ_ONLY -- so the tool cannot mutate a tree, an
+index or a ref even if a future edit tries to. tests/test_git_roost.py asserts
+that whitelist holds.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import shutil
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+__version__ = "0.1"
+
+HOME = Path.home()
+
+# ~/GitHub is where every repo on this machine lives. Overridable because that
+# is a fact about one box, not about git.
+DEFAULT_ROOTS = (HOME / "GitHub",)
+
+# How deep to look for a repo below a root. Worktrees live at
+# <root>/.worktrees/<repo>/<slug>, which is depth 3, so 3 is the floor and the
+# default. Deeper costs a directory walk and finds mostly vendored junk.
+DEFAULT_DEPTH = 3
+
+# Never descend into these. A node_modules with its own .git is not a repo you
+# are working in, and walking one costs more than the whole rest of the scan.
+PRUNE = frozenset((
+    "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
+    ".pytest_cache", "build", "dist", "target", ".next", ".cargo", "Library",
+    ".Trash", "vendor", ".terraform",
+))
+
+# Worktrees can live inside the repo as well as beside it: ccwork puts them at
+# <root>/.worktrees/, but Claude Code's own put them at <repo>/.claude/worktrees/.
+# Finding a repo prunes the walk, so these two have to be descended explicitly or
+# the second kind is invisible.
+NESTED_WORKTREE_DIRS = (".worktrees", Path(".claude") / "worktrees")
+
+GIT_TIMEOUT = float(os.environ.get("GIT_ROOST_TIMEOUT") or 5)
+GIT_WORKERS = int(os.environ.get("GIT_ROOST_WORKERS") or 12)
+
+# A commit this recent means someone is working in the tree right now.
+ACTIVE_SECS = 3600
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+CYAN = "\033[36m"
+
+COLOR = False
+
+
+def c(text, *codes):
+    if not COLOR or not codes:
+        return text
+    return "".join(codes) + text + RESET
+
+
+def ascii_safe(s):
+    """Drop characters the console cannot render.
+
+    Commit subjects are free-form prose and routinely carry em dashes and smart
+    quotes; the Windows console codepage turns those into replacement blobs
+    mid-table.
+    """
+    if not s:
+        return ""
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in s)
+
+
+def enable_windows_ansi():
+    """Turn on VT processing so escapes render instead of printing literally."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        k = ctypes.windll.kernel32
+        handle = k.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if not k.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        enable_vt = 0x0004
+        if mode.value & enable_vt:
+            return True
+        return bool(k.SetConsoleMode(handle, mode.value | enable_vt))
+    except Exception:
+        return False
+
+
+def dur(secs):
+    """Age, at one significant unit. Same vocabulary as roost's."""
+    if secs is None:
+        return "-"
+    secs = int(secs)
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    if secs < 86400:
+        return "%dh" % (secs // 3600)
+    return "%dd" % (secs // 86400)
+
+
+# ---------------------------------------------------------------- git plumbing
+
+# Every subcommand this tool is allowed to run. All of them are read-only: they
+# report, they do not touch the index, the worktree or any ref. Anything not
+# listed raises rather than running -- the guarantee in the module docstring is
+# only worth something if it is enforced somewhere.
+READ_ONLY = frozenset((
+    "rev-parse", "status", "rev-list", "log", "stash", "config", "symbolic-ref",
+))
+
+
+class NotReadOnly(RuntimeError):
+    """Raised when a caller asks git() for a subcommand that could write."""
+
+
+def git(dirpath, *args):
+    """One read-only git call. None on any failure -- git state is best-effort.
+
+    A tree can vanish, be mid-rebase, or belong to another user between the scan
+    and the call. None of that is worth an exception: the row just shows what it
+    could learn and dashes for the rest.
+    """
+    if not args or args[0] not in READ_ONLY:
+        raise NotReadOnly("git-roost refuses non-read-only subcommand: %r" % (args[:1],))
+    try:
+        out = subprocess.run(
+            ("git", "-C", str(dirpath)) + tuple(args),
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.rstrip("\n")
+
+
+def is_repo(path):
+    """A .git entry -- directory for a normal clone, file for a worktree."""
+    return (path / ".git").exists()
+
+
+def discover(roots, depth=DEFAULT_DEPTH):
+    """Every working tree at or below the roots, deduped, in stable order."""
+    found = []
+    seen = set()
+
+    def add(path):
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            found.append(path)
+
+    def walk(path, remaining):
+        try:
+            if not path.is_dir():
+                return
+        except OSError:
+            return
+        if is_repo(path):
+            add(path)
+            # Stop here, except for the two places a worktree hides inside its
+            # own repo. Descending a whole repo finds only vendored copies.
+            for nested in NESTED_WORKTREE_DIRS:
+                sub = path / nested
+                if sub.is_dir():
+                    for child in sorted_dirs(sub):
+                        walk(child, 1)
+            return
+        if remaining <= 0:
+            return
+        for child in sorted_dirs(path):
+            walk(child, remaining - 1)
+
+    for root in roots:
+        walk(Path(root).expanduser(), depth)
+    return found
+
+
+def sorted_dirs(path):
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+    return [p for p in entries if p.is_dir() and p.name not in PRUNE]
+
+
+def operation_in_progress(git_dir):
+    """Whatever multi-step git operation this tree is stuck in the middle of.
+
+    This is the single most useful thing on the board: a tree halted mid-rebase
+    looks identical to an idle one in every other column, and it is the state
+    that most needs a human.
+    """
+    if not git_dir:
+        return ""
+    d = Path(git_dir)
+    for name, label in (
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+        ("BISECT_LOG", "bisect"),
+    ):
+        if (d / name).exists():
+            return label
+    return ""
+
+
+def parse_porcelain_v2(text):
+    """Branch, upstream, ahead/behind and file counts out of one status call.
+
+    `status --porcelain=v2 --branch` carries all of it, which is why it is worth
+    parsing a slightly awkward format: the obvious alternative is four separate
+    git invocations, and at ~30 trees a redraw that is 90 extra process spawns.
+    """
+    out = {
+        "branch": "", "detached": False, "upstream": "",
+        "ahead": None, "behind": None,
+        "tracked": 0, "untracked": 0, "conflicts": 0,
+    }
+    if text is None:
+        return out
+    for line in text.splitlines():
+        if line.startswith("# branch.head "):
+            head = line[14:].strip()
+            if head == "(detached)":
+                out["detached"] = True
+            else:
+                out["branch"] = head
+        elif line.startswith("# branch.oid "):
+            out["oid"] = line[13:].strip()
+        elif line.startswith("# branch.upstream "):
+            out["upstream"] = line[18:].strip()
+        elif line.startswith("# branch.ab "):
+            # "+1 -4" -- signs are decoration, the counts are what matter.
+            parts = line[12:].split()
+            if len(parts) == 2:
+                try:
+                    out["ahead"] = abs(int(parts[0]))
+                    out["behind"] = abs(int(parts[1]))
+                except ValueError:
+                    pass
+        elif line.startswith("? "):
+            out["untracked"] += 1
+        elif line.startswith("u "):
+            # Unmerged. These are live conflicts, not merely modified files.
+            out["conflicts"] += 1
+            out["tracked"] += 1
+        elif line[:2] in ("1 ", "2 "):
+            out["tracked"] += 1
+    return out
+
+
+# Stashes and remote refs live in the common dir, so every worktree of a repo
+# gives the same answer. Asking once per tree instead of once per repo was 16
+# redundant subprocess spawns here. Reset per scan -- a cache that outlived a
+# redraw would quietly show stale counts in watch mode.
+_repo_cache = {}
+_repo_lock = threading.Lock()
+
+
+def repo_facts(path, common_dir):
+    """Repo-level facts, computed once per common dir and shared by its trees."""
+    key = common_dir or str(path)
+    with _repo_lock:
+        hit = _repo_cache.get(key)
+    if hit is not None:
+        return hit
+
+    facts = {"stashes": 0, "origin_head": ""}
+    stashes = git(path, "stash", "list")
+    if stashes:
+        facts["stashes"] = len([ln for ln in stashes.splitlines() if ln])
+    head = git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    facts["origin_head"] = head or ""
+
+    with _repo_lock:
+        _repo_cache.setdefault(key, facts)
+    return facts
+
+
+def tree_state(path):
+    """Everything one working tree can tell us, in as few calls as possible."""
+    paths = git(path, "rev-parse", "--show-toplevel", "--absolute-git-dir",
+                "--path-format=absolute", "--git-common-dir")
+    lines = paths.splitlines() if paths else []
+    if len(lines) >= 3:
+        toplevel, git_dir, common = lines[0], lines[1], lines[2]
+    else:
+        # --path-format landed in git 2.31. Rather than report a readable repo
+        # as unreadable on an older git, pay for the extra calls on that path.
+        toplevel = git(path, "rev-parse", "--show-toplevel")
+        if not toplevel:
+            return None
+        git_dir = git(path, "rev-parse", "--absolute-git-dir") or ""
+        common = git(path, "rev-parse", "--git-common-dir") or git_dir
+        if common and not os.path.isabs(common):
+            common = os.path.join(toplevel, common)
+
+    # The common dir is shared by a repo and all of its worktrees, so it is the
+    # only stable identity for "these trees are the same project". The basename
+    # of its parent is the repo name; ".git" itself is not a useful label.
+    repo_root = Path(common).parent if common else Path(toplevel)
+
+    status = parse_porcelain_v2(git(path, "status", "--porcelain=v2", "--branch"))
+    facts = repo_facts(path, common)
+
+    st = {
+        "path": str(path),
+        "toplevel": toplevel,
+        "common_dir": common,
+        "repo": repo_root.name or toplevel,
+        "tree": "(primary)" if Path(toplevel) == repo_root else Path(toplevel).name,
+        "branch": status["branch"],
+        "detached": status["detached"],
+        "base": status["upstream"],
+        "ahead": status["ahead"],
+        "behind": status["behind"],
+        "tracked": status["tracked"],
+        "untracked": status["untracked"],
+        "conflicts": status["conflicts"],
+        "stashes": facts["stashes"],
+        "operation": operation_in_progress(git_dir),
+        "last_ts": None,
+        "last_hash": "",
+        "last_author": "",
+        "last_subject": "",
+    }
+
+    if st["detached"]:
+        # The sha is the only honest label, and saying so matters -- a commit
+        # made here lands on no branch at all.
+        st["branch"] = git(path, "rev-parse", "--short", "HEAD") or "?"
+
+    # status --branch already gave ahead/behind when the branch has an upstream.
+    # When it has none, fall back to origin/HEAD: ccwork branches are never
+    # pushed, so an upstream-only check calls them all clean -- on 2026-07-30
+    # that reported all 8 drifted counting-chicken-wings worktrees as current.
+    if not st["base"] and facts["origin_head"]:
+        st["base"] = facts["origin_head"]
+        counts = git(path, "rev-list", "--left-right", "--count",
+                     "HEAD...%s" % st["base"])
+        if counts:
+            parts = counts.split()
+            if len(parts) == 2 and all(p.isdigit() for p in parts):
+                st["ahead"], st["behind"] = int(parts[0]), int(parts[1])
+
+    last = git(path, "log", "-1", "--format=%ct%x00%h%x00%an%x00%s")
+    if last:
+        bits = last.split("\0")
+        if len(bits) == 4 and bits[0].isdigit():
+            st["last_ts"] = int(bits[0])
+            st["last_hash"] = bits[1]
+            st["last_author"] = bits[2]
+            st["last_subject"] = bits[3]
+
+    return st
+
+
+def collect(paths):
+    # Repo-level facts are memoized within a scan and must not survive it: in
+    # watch mode a stale cache would keep showing a stash that was just popped.
+    with _repo_lock:
+        _repo_cache.clear()
+    if not paths:
+        return []
+    with ThreadPoolExecutor(max_workers=min(GIT_WORKERS, len(paths))) as pool:
+        states = list(pool.map(tree_state, paths))
+    return [s for s in states if s]
+
+
+# ------------------------------------------------------------------- grouping
+
+def bucket(st, now=None):
+    """Which attention group a tree belongs in, most actionable first.
+
+    Ordered by what it costs to ignore, not by how interesting it looks. A tree
+    stuck mid-rebase is blocking someone right now; a diverged one will cost a
+    conflict later; uncommitted work is merely unsaved. Everything in sync and
+    quiet is noise until it is not.
+    """
+    now = now or time.time()
+    if st["operation"]:
+        return 0, "MID-OPERATION"
+    ahead, behind = st.get("ahead") or 0, st.get("behind") or 0
+    if ahead and behind:
+        return 1, "DIVERGED"
+    if st["tracked"]:
+        return 2, "UNCOMMITTED"
+    if ahead:
+        return 3, "UNPUSHED"
+    if behind:
+        return 4, "BEHIND"
+    if st["last_ts"] and now - st["last_ts"] < ACTIVE_SECS:
+        return 5, "ACTIVE"
+    return 6, "QUIET"
+
+
+BUCKET_COLORS = {0: RED, 1: RED, 2: YELLOW, 3: YELLOW, 4: BLUE, 5: GREEN, 6: DIM}
+
+
+def work(st):
+    """Uncommitted work, compactly. Untracked is flagged but never alarming.
+
+    Untracked files are mostly scratch output -- one tree here carries 12 of
+    them permanently -- so they get a marker, not a bucket.
+    """
+    tracked, untracked = st["tracked"], st["untracked"]
+    if not tracked and not untracked:
+        return "clean"
+    out = str(tracked) if tracked else ""
+    if untracked:
+        out += "+%d?" % untracked
+    return out
+
+
+def drift(st):
+    """Position against the base branch: '=', '^2', 'v3', '^2v3', or '-'."""
+    if not st["base"] or st["ahead"] is None:
+        return "-"
+    ahead, behind = st["ahead"], st["behind"]
+    if not ahead and not behind:
+        return "="
+    return ("^%d" % ahead if ahead else "") + ("v%d" % behind if behind else "")
+
+
+def sort_key(st):
+    order, _ = bucket(st)
+    # Within a group, the tree touched most recently is the one being worked in.
+    return (order, -(st["last_ts"] or 0), st["repo"], st["tree"])
+
+
+# -------------------------------------------------------------------- render
+
+COLUMNS = (
+    ("REPO", lambda s: s["repo"]),
+    ("TREE", lambda s: s["tree"]),
+    ("BRANCH", lambda s: ("@" + s["branch"]) if s["detached"] else s["branch"]),
+    ("WORK", work),
+    ("DRIFT", drift),
+    ("STASH", lambda s: str(s["stashes"]) if s["stashes"] else ""),
+    ("LAST", lambda s: dur(time.time() - s["last_ts"]) if s["last_ts"] else "-"),
+)
+
+
+def render(states, width=160, expand_quiet=False):
+    if not states:
+        return ["no git repositories found"]
+
+    rows = sorted(states, key=sort_key)
+    shown = [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
+    quiet = [s for s in rows if bucket(s)[1] == "QUIET" and not expand_quiet]
+
+    cells = [[fn(s) for _, fn in COLUMNS] for s in shown]
+    headers = [h for h, _ in COLUMNS]
+    widths = [
+        max([len(headers[i])] + [row[i] and len(row[i]) or 0 for row in cells] or [0])
+        for i in range(len(COLUMNS))
+    ]
+
+    used = sum(widths) + 2 * len(widths) + 2
+    subject_w = max(20, width - used - 2)
+
+    lines = []
+    lines.append(c("  " + "  ".join(
+        headers[i].ljust(widths[i]) for i in range(len(COLUMNS))
+    ) + "  " + "SUBJECT", BOLD))
+
+    current = None
+    for st, row in zip(shown, cells):
+        order, label = bucket(st)
+        if label != current:
+            current = label
+            lines.append(c(label, BUCKET_COLORS.get(order, ""), BOLD))
+        subject = ascii_safe(st["last_subject"])
+        if st["operation"]:
+            # Overwrite the subject: what it is stuck doing beats what it last
+            # did, and an unresolved conflict count is the actionable part.
+            subject = "** %s in progress" % st["operation"]
+            if st["conflicts"]:
+                subject += ", %d conflict(s)" % st["conflicts"]
+            subject += " **"
+        if len(subject) > subject_w:
+            subject = subject[: subject_w - 3] + "..."
+        body = "  ".join(row[i].ljust(widths[i]) for i in range(len(COLUMNS)))
+        lines.append("  " + body + "  " + subject)
+
+    if quiet:
+        names = " . ".join(sorted({"%s/%s" % (s["repo"], s["tree"]) for s in quiet}))
+        lines.append("")
+        lines.append(c("QUIET (%d)  " % len(quiet) + names, DIM))
+
+    lines.append("")
+    repos = len({s["common_dir"] for s in states})
+    dirty = sum(1 for s in states if s["tracked"])
+    stuck = sum(1 for s in states if s["operation"])
+    summary = "%d tree(s) across %d repo(s)" % (len(states), repos)
+    if dirty:
+        summary += "  |  %d with uncommitted work" % dirty
+    if stuck:
+        summary += "  |  %d mid-operation" % stuck
+    lines.append(summary)
+    return lines
+
+
+# ---------------------------------------------------------------- commit feed
+
+def commits_for(st, limit):
+    out = git(st["path"], "log", "-%d" % limit, "--format=%ct%x00%h%x00%an%x00%s")
+    if not out:
+        return []
+    rows = []
+    for line in out.splitlines():
+        bits = line.split("\0")
+        if len(bits) != 4 or not bits[0].isdigit():
+            continue
+        rows.append({
+            "ts": int(bits[0]),
+            "hash": bits[1],
+            "author": bits[2],
+            "subject": bits[3],
+            "repo": st["repo"],
+            "tree": st["tree"],
+            "branch": st["branch"],
+        })
+    return rows
+
+
+def render_log(states, limit, width=160):
+    """One merged feed, newest first.
+
+    Deduped by (common dir, sha): a repo and its worktrees share history, so
+    every commit would otherwise appear once per tree -- here that is five or six
+    times for the busy repos.
+    """
+    by_repo = {}
+    for st in states:
+        by_repo.setdefault(st["common_dir"] or st["toplevel"], []).append(st)
+
+    work_items = []
+    for trees in by_repo.values():
+        for st in trees:
+            work_items.append(st)
+
+    with ThreadPoolExecutor(max_workers=min(GIT_WORKERS, max(1, len(work_items)))) as pool:
+        batches = list(pool.map(lambda s: commits_for(s, limit), work_items))
+
+    seen = set()
+    merged = []
+    for st, batch in zip(work_items, batches):
+        repo_key = st["common_dir"] or st["toplevel"]
+        for row in batch:
+            key = (repo_key, row["hash"])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+
+    merged.sort(key=lambda r: -r["ts"])
+    merged = merged[:limit]
+    if not merged:
+        return ["no commits found"]
+
+    now = time.time()
+    w_repo = max([4] + [len(r["repo"]) for r in merged])
+    w_branch = max([6] + [len(r["branch"]) for r in merged])
+    w_author = max([6] + [len(ascii_safe(r["author"])) for r in merged])
+    used = 5 + w_repo + w_branch + w_author + 9 + 10
+    subject_w = max(20, width - used)
+
+    lines = [c("  ".join((
+        "AGE".ljust(4), "REPO".ljust(w_repo), "BRANCH".ljust(w_branch),
+        "SHA".ljust(7), "AUTHOR".ljust(w_author), "SUBJECT",
+    )), BOLD)]
+    for r in merged:
+        subject = ascii_safe(r["subject"])
+        if len(subject) > subject_w:
+            subject = subject[: subject_w - 3] + "..."
+        lines.append("  ".join((
+            dur(now - r["ts"]).ljust(4),
+            r["repo"].ljust(w_repo),
+            r["branch"].ljust(w_branch),
+            r["hash"].ljust(7),
+            ascii_safe(r["author"]).ljust(w_author),
+            subject,
+        )))
+    lines.append("")
+    lines.append("%d commit(s) across %d repo(s)" % (len(merged), len({r["repo"] for r in merged})))
+    return lines
+
+
+# ------------------------------------------------------------------------ cli
+
+def scan(args):
+    roots = [Path(r).expanduser() for r in args.root] if args.root else list(DEFAULT_ROOTS)
+    return collect(discover(roots, args.depth))
+
+
+def body(args, width):
+    states = scan(args)
+    if args.json:
+        return [json.dumps(states, indent=2, sort_keys=True)]
+    if args.log is not None:
+        return render_log(states, args.log, width)
+    return render(states, width, expand_quiet=args.all)
+
+
+def main(argv=None):
+    global COLOR
+
+    ap = argparse.ArgumentParser(
+        prog="git-roost",
+        description="top for git -- every repo and worktree, most actionable first.",
+    )
+    ap.add_argument("--version", action="version", version="git-roost %s" % __version__)
+    ap.add_argument("-w", "--watch", nargs="?", const=3.0, type=float, metavar="SECS",
+                    help="redraw every SECS seconds (default 3)")
+    ap.add_argument("--log", nargs="?", const=25, type=int, metavar="N",
+                    help="commit feed across every repo, newest first (default 25)")
+    ap.add_argument("-a", "--all", action="store_true", help="expand the QUIET group")
+    ap.add_argument("--root", action="append", metavar="DIR",
+                    help="where to look for repos (repeatable; default ~/GitHub)")
+    ap.add_argument("--depth", type=int, default=DEFAULT_DEPTH, metavar="N",
+                    help="how deep to search below each root (default %d)" % DEFAULT_DEPTH)
+    ap.add_argument("--json", action="store_true", help="emit records as JSON")
+    ap.add_argument("--no-color", action="store_true", help="disable colour output")
+    args = ap.parse_args(argv)
+
+    # Colour needs escape support and a real terminal. NO_COLOR is the community
+    # convention (https://no-color.org) and costs nothing to honour.
+    COLOR = (
+        not args.no_color
+        and not os.environ.get("NO_COLOR")
+        and sys.stdout.isatty()
+        and enable_windows_ansi()
+    )
+    if args.json:
+        COLOR = False
+
+    if not args.watch:
+        width = shutil.get_terminal_size((160, 24)).columns
+        print("\n".join(body(args, width)))
+        return 0
+
+    try:
+        while True:
+            width = shutil.get_terminal_size((160, 24)).columns
+            out = body(args, width)
+            sys.stdout.write("\033[H\033[2J")
+            sys.stdout.write(time.strftime("git-roost  %H:%M:%S") + "\n\n")
+            sys.stdout.write("\n".join(out) + "\n")
+            sys.stdout.flush()
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
