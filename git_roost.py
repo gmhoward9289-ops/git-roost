@@ -319,6 +319,7 @@ def parse_porcelain_v2(text):
         "branch": "", "detached": False, "upstream": "",
         "ahead": None, "behind": None,
         "tracked": 0, "untracked": 0, "conflicts": 0,
+        "staged": 0, "unstaged": 0,
     }
     if text is None:
         return out
@@ -350,6 +351,13 @@ def parse_porcelain_v2(text):
             out["tracked"] += 1
         elif line[:2] in ("1 ", "2 "):
             out["tracked"] += 1
+            # The XY pair: X is the index side, Y the working-tree side. One
+            # file can count on both -- partially staged is both true things.
+            xy = line[2:4]
+            if xy[0:1] not in (".", ""):
+                out["staged"] += 1
+            if xy[1:2] not in (".", ""):
+                out["unstaged"] += 1
     return out
 
 
@@ -451,6 +459,8 @@ def tree_state(path):
         "ahead": status["ahead"],
         "behind": status["behind"],
         "tracked": status["tracked"],
+        "staged": status["staged"],
+        "unstaged": status["unstaged"],
         "untracked": status["untracked"],
         "conflicts": status["conflicts"],
         "stashes": facts["stashes"],

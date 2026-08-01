@@ -200,6 +200,19 @@ class TestPorcelainParse(unittest.TestCase):
         self.assertEqual(out["conflicts"], 1)
         self.assertEqual(out["tracked"], 1)
 
+    def test_staged_and_unstaged_split_and_a_file_can_be_both(self):
+        text = "\n".join((
+            "# branch.head main",
+            "1 M. N... 100644 100644 100644 aaa bbb staged_only.py",
+            "1 .M N... 100644 100644 100644 aaa bbb unstaged_only.py",
+            "1 MM N... 100644 100644 100644 aaa bbb partially_staged.py",
+            "2 R. N... 100644 100644 100644 ccc ddd R100 new.py\told.py",
+        ))
+        out = git_roost.parse_porcelain_v2(text)
+        self.assertEqual(out["tracked"], 4)
+        self.assertEqual(out["staged"], 3)     # staged_only + partial + rename
+        self.assertEqual(out["unstaged"], 2)   # unstaged_only + partial
+
     def test_no_upstream_leaves_ahead_behind_unknown(self):
         # Not zero -- unknown. Zero would render as "=", claiming it is in sync.
         out = git_roost.parse_porcelain_v2("# branch.head feat/x")
