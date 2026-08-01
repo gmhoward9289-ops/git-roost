@@ -510,6 +510,28 @@ class TestCli(unittest.TestCase):
             self.assertEqual(data[0]["repo"], "alpha")
 
     @needs_git
+    def test_json_record_keys_are_a_stable_contract(self):
+        # ccboard (leghorn's data layer) consumes `git-roost --json`. Adding a
+        # key is safe; renaming or removing one breaks a consumer this suite
+        # cannot see. If you are changing the shape deliberately, update this
+        # set and ccboard's gather_git() together. assertEqual, not a subset
+        # check: a subset check passes when a key is deleted, which is exactly
+        # the case that breaks the consumer.
+        EXPECTED = {
+            "ahead", "base", "behind", "branch", "common_dir", "conflicts",
+            "detached", "last_author", "last_hash", "last_subject", "last_ts",
+            "operation", "path", "repo", "staged", "stashes", "toplevel",
+            "tracked", "tree", "unstaged", "untracked",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json"])
+            data = json.loads(buf.getvalue())
+            self.assertEqual(set(data[0]), EXPECTED)
+
+    @needs_git
     def test_log_feed_does_not_repeat_a_commit_per_worktree(self):
         # A repo and its worktrees share history. Without dedup the busy repos
         # here show every commit five or six times.
