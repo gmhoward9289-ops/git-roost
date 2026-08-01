@@ -33,9 +33,9 @@ classifiers = [
 # Python is already on the box, including a bare system 3.9 on macOS.
 dependencies = []
 
-# Deliberately no [project.urls] yet -- the repo has no remote. Adding a
-# Homepage that 404s is worse than omitting it, and PyPI renders it verbatim.
-# Restore the Homepage/Issues pair from roost's pyproject once the remote exists.
+[project.urls]
+Homepage = "https://github.com/gmhoward9289-ops/git-roost"
+Issues = "https://github.com/gmhoward9289-ops/git-roost/issues"
 
 [project.scripts]
 git-roost = "git_roost:main"
