@@ -59,7 +59,7 @@ class GitRoost < Formula
     # has to produce the empty-state line rather than fail or print nothing.
     # Matching that line specifically, because a loose pattern here would pass
     # on almost any output including an error message.
-    assert_match(/no git repositor/i,
+    assert_match(/no git repository/i,
                  shell_output("#{bin}/git-roost --once --no-color --root #{testpath}"))
   end
 end
