@@ -12,14 +12,14 @@ dynamic = ["version"]
 description = "top for git -- every repo and worktree on the box, most actionable first"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "George M. Howard", email = "dev@swamplink.com" }]
 keywords = ["git", "tui", "top", "monitoring", "worktree", "repos", "dashboard"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
