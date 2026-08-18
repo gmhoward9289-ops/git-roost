@@ -23,7 +23,7 @@ class GitRoost < Formula
   homepage "https://github.com/gmhoward9289-ops/git-roost"
   url "https://github.com/gmhoward9289-ops/git-roost/archive/refs/tags/v0.1.tar.gz"
   sha256 "0ad6b09bcb645b60a24684613f0733b05b336aefb2fee33ec6ca32e7449f521c"
-  license "MIT"
+  license "Apache-2.0"
 
   depends_on "python@3.13"
   # git is a runtime dependency in a way it is not for roost: with no git on
