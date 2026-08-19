@@ -293,13 +293,20 @@ jobs:
         run: |
           set -euo pipefail
           # Every pattern here is anchored at start-of-line and bounded by the
-          # closing quote, both deliberately. The formula's header comment
-          # discusses `sha256 "..."` and `version "..."` in prose; an unanchored
-          # match rewrites that prose instead of the directive, and a greedy
-          # `".*"` would swallow the `# x-release-please-version` marker off the
-          # end of the version line -- which is the marker release-please needs
-          # to bump it at all, so the next release would silently stop updating
-          # the formula.
+          # closing quote, both deliberately. Do not simplify either back.
+          #
+          # Anchored, because the formula's header comment discusses
+          # `sha256 "..."` and `version "..."` in prose -- an unanchored match
+          # rewrites the prose instead of the directive.
+          #
+          # `"[^"]*"` rather than the more natural-looking `".*"`, because
+          # greedy would swallow the trailing `# x-release-please-version`
+          # marker off the end of the version line, and that marker is what
+          # release-please needs in order to bump the formula at all. The
+          # resulting failure is both delayed and unattributable: this release
+          # publishes correctly, and some later release quietly stops bumping
+          # the formula with nothing pointing back at this sed. Cheap to keep
+          # right, near-impossible to diagnose once wrong.
           sed -e "s#^\([[:space:]]*\)sha256 \"[^\"]*\"#\1sha256 \"$SHA256\"#" \
               -e "s#^\([[:space:]]*\)version \"[^\"]*\"#\1version \"$VERSION\"#" \
               src/packaging/git-roost.rb > tap/Formula/git-roost.rb
