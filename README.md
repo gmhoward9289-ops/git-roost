@@ -102,12 +102,34 @@ Watch mode takes keys:
 | `s` | sort: recent / repo / work |
 | `f` | filter: all / uncommitted / mid-operation |
 | `a` | expand or collapse `QUIET` |
+| `l` | toggle the fleet table and the commit feed, without restarting |
+| `j` / `k` | move the row cursor down / up |
+| `enter` | open a detail view for the highlighted tree |
 | `q` | quit |
 
 Sort cycles *within* a group and never across one. The group order is the whole
 argument this tool makes — cost of ignoring, not recency or size — so a sort
 that let an `ACTIVE` tree float above a `MID-OPERATION` one would be quietly
-answering a different question.
+answering a different question. Changing sort, filter or the quiet toggle
+resets the row cursor rather than leaving it pointing at whatever row happens
+to land underneath it.
+
+`l` used to be a restart: `--log` decided table-or-feed once, at launch. Now
+it just seeds the initial view — `git-roost --log -w` opens on the feed, and
+`git-roost -w` opens on the table — and `l` flips between the two live,
+without losing the scan already in flight.
+
+`j`/`k` move a highlighted row through whatever the table is currently
+showing — same sort, same filter, same QUIET collapse everyone else sees.
+`enter` opens a detail screen for that tree: its whole stash list rather than
+just a count, a diffstat of the most recent stash, what it's stuck doing if
+anything, and its last five commits. Any other key returns to the table, the
+same way dismissing the `?` overlay does — one dismissal convention, not two.
+
+Two consecutive frames of an idle fleet used to be indistinguishable from each
+other, which is a strange thing for a tool named after `top`. Now a row whose
+group, `WORK` or `DRIFT` changed since the last redraw is marked with a
+leading `*`, so watching quietly still tells you when something moved.
 
 Keys need a terminal. Piped, redirected, or on a box with neither `termios` nor
 `msvcrt`, watch mode degrades to the plain timer redraw rather than failing, and

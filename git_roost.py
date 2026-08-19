@@ -18,8 +18,10 @@ uncommitted work nobody has looked at, who is stuck mid-rebase.
     git-roost --json         # records, for piping somewhere else
 
 Watch mode takes keys -- `?` for the map, `r` refresh, `s` sort, `f` filter, `a`
-quiet, `q` quit. The default one-shot render takes none and touches no terminal
-settings at all, which is what keeps it safe to pipe.
+quiet, `l` toggles the table for the commit feed, `j`/`k` move a row cursor,
+`enter` opens a detail view for the highlighted tree, `q` quit. The default
+one-shot render takes none and touches no terminal settings at all, which is
+what keeps it safe to pipe.
 
 One file, no dependencies, Python 3.9+, macOS/Linux/Windows -- the same
 constraints as roost, for the same reason: it has to run on whatever Python is
@@ -117,6 +119,7 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 BLUE = "\033[34m"
 CYAN = "\033[36m"
+MAGENTA = "\033[35m"
 
 COLOR = False
 
@@ -649,7 +652,26 @@ COLUMNS = (
 )
 
 
-def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"):
+def visible_rows(states, expand_quiet=False, sort_mode="recent", filt="all"):
+    """Sorted, filtered rows with QUIET collapsed away -- exactly what render()
+    draws as its table.
+
+    Watch mode's cursor walks this same list, kept as its own function so `j`/
+    `k` land on a row that is actually on screen instead of drifting out of
+    sync with render()'s own filtering the next time one of the two changes.
+    """
+    if filt != "all":
+        states = [s for s in states if passes_filter(s, filt)]
+    rows = sorted(states, key=lambda st: sort_key(st, sort_mode))
+    return [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
+
+
+def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all",
+           changed=None):
+    """`changed` is a set of tree paths whose bucket, WORK or DRIFT differ from
+    the previous watch-mode frame -- see frame_signature(). None outside watch
+    mode, where there is no previous frame to compare against.
+    """
     if not states:
         return ["no git repositories found"]
 
@@ -696,7 +718,12 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
         if len(subject) > subject_w:
             subject = subject[: subject_w - 3] + "..."
         body = "  ".join(row[i].ljust(widths[i]) for i in range(len(COLUMNS)))
-        lines.append("  " + body + "  " + subject)
+        is_changed = bool(changed) and st["path"] in changed
+        marker = "* " if is_changed else "  "
+        line = marker + body + "  " + subject
+        if is_changed:
+            line = c(line, MAGENTA, BOLD)
+        lines.append(line)
 
     if quiet:
         names = " . ".join(sorted({"%s/%s" % (s["repo"], s["tree"]) for s in quiet}))
@@ -814,6 +841,75 @@ def render_log(states, limit, width=160):
     return lines
 
 
+def frame_signature(st):
+    """What "changed since last frame" means: bucket, WORK and DRIFT.
+
+    Not the whole state dict -- LAST ticks every second and would mark every
+    row changed on every redraw, which is the opposite of a "what moved"
+    signal.
+    """
+    return (bucket(st)[1], work(st), drift(st))
+
+
+def detail_lines(st, width=160):
+    """Everything one tree has that the table has no room for: the whole
+    stash list rather than a count, what it is stuck doing, and its last five
+    commits.
+
+    Read-only, same as everywhere else -- `stash list` and `stash show -p` are
+    both on the READ_ONLY allowlist, and commits come from the already-allowed
+    `commits_for()`.
+    """
+    lines = [c("%s/%s" % (st["repo"], st["tree"]), BOLD)]
+    lines.append(("@" + st["branch"]) if st["detached"] else (st["branch"] or "-"))
+    lines.append(st["path"])
+    lines.append("")
+
+    if st["operation"]:
+        op_line = "** %s in progress **" % st["operation"]
+        if st["conflicts"]:
+            op_line += "  (%d conflict(s))" % st["conflicts"]
+        lines.append(c(op_line, RED, BOLD))
+        lines.append("")
+
+    lines.append(c("STASH", BOLD))
+    stash_out = git(st["path"], "stash", "list")
+    entries = [ln for ln in (stash_out or "").splitlines() if ln]
+    if not entries:
+        lines.append("  (none)")
+    else:
+        for entry in entries:
+            lines.append("  " + ascii_safe(entry))
+        # The most recent stash is the one someone is most likely to come back
+        # for, so it is the one worth a diffstat rather than just a subject
+        # line. `-p` is capped at 30 lines -- enough to see what is in it
+        # without dumping a whole patch into a table-shaped screen.
+        patch = git(st["path"], "stash", "show", "-p", "stash@{0}")
+        if patch:
+            diff_lines = patch.splitlines()
+            lines.append("")
+            lines.append(c("  stash@{0}:", DIM))
+            for dl in diff_lines[:30]:
+                lines.append("  " + ascii_safe(dl))
+            if len(diff_lines) > 30:
+                lines.append("  ... %d more line(s)" % (len(diff_lines) - 30))
+    lines.append("")
+
+    lines.append(c("LAST 5 COMMITS", BOLD))
+    commits = commits_for(st, 5)
+    if not commits:
+        lines.append("  (no commits)")
+    else:
+        now = time.time()
+        for r in commits:
+            lines.append("  %s  %s  %s" % (
+                dur(now - r["ts"]).ljust(4), r["hash"].ljust(7),
+                ascii_safe(r["subject"])))
+    lines.append("")
+    lines.append(c("any other key returns to the table", DIM))
+    return lines
+
+
 # ------------------------------------------------------------------- watch keys
 
 KEYMAP = (
@@ -822,6 +918,10 @@ KEYMAP = (
     ("s", "sort: recent / repo / work (within a group, never across)"),
     ("f", "filter: all / uncommitted / mid-operation"),
     ("a", "expand or collapse QUIET"),
+    ("l", "toggle table / commit feed"),
+    ("j", "move the cursor down"),
+    ("k", "move the cursor up"),
+    ("enter", "open a detail view for the highlighted tree"),
     ("q", "quit"),
 )
 
@@ -921,12 +1021,22 @@ def help_lines():
     return out
 
 
-def apply_key(view, key):
+def apply_key(view, key, shown=None):
     """Fold one keypress into the live view. Returns "quit", "help" or None.
 
     Split out of the watch loop so the keymap can be tested without a terminal.
     Every other path in this file is testable headlessly and this one was not,
     which is how a key ends up bound to nothing and nobody notices.
+
+    `shown` is the row list the table currently has on screen (from
+    visible_rows()) -- j/k/enter need it to know how far the cursor can move
+    and which tree "enter" opens. It is None outside watch mode and for keys
+    that do not touch the cursor, so every other call site is unaffected.
+
+    Exiting a detail view is not handled here: the watch loop clears
+    view["detail"] on the next keypress before apply_key is even called,
+    the same way it already handles the help overlay -- one overlay-dismissal
+    path, not two.
     """
     if key in ("q", "Q"):
         return "quit"
@@ -935,25 +1045,50 @@ def apply_key(view, key):
     if key in ("s", "S"):
         view["sort"] = SORT_MODES[
             (SORT_MODES.index(view["sort"]) + 1) % len(SORT_MODES)]
+        view["cursor"] = 0
     elif key in ("f", "F"):
         view["filter"] = FILTER_MODES[
             (FILTER_MODES.index(view["filter"]) + 1) % len(FILTER_MODES)]
+        view["cursor"] = 0
     elif key in ("a", "A"):
         view["quiet"] = not view["quiet"]
+        view["cursor"] = 0
+    elif key in ("l", "L"):
+        view["log"] = not view["log"]
+        view["cursor"] = 0
+    elif key in ("j", "J"):
+        # Sort, filter or the quiet toggle can shrink the shown set out from
+        # under a cursor sitting near the bottom -- clamp every time rather
+        # than trusting the value left over from a wider frame.
+        if shown:
+            last = len(shown) - 1
+            view["cursor"] = min(max(0, view.get("cursor", 0)) + 1, last)
+    elif key in ("k", "K"):
+        if shown:
+            last = len(shown) - 1
+            view["cursor"] = max(0, min(view.get("cursor", 0), last) - 1)
+    elif key in ("\r", "\n", "enter"):
+        if shown:
+            cursor = max(0, min(view.get("cursor", 0), len(shown) - 1))
+            view["cursor"] = cursor
+            view["detail"] = shown[cursor]
     # 'r' -- and any unbound key -- falls through to an immediate redraw, which
     # is what refresh means here: the scan happens on the next line of the loop,
     # not behind a cache.
     return None
 
 
-def status_line(sort_mode, filt, expand_quiet, interval):
+def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table"):
     """The one line that says what view you are looking at.
 
     Without it a filtered table is indistinguishable from a fleet that happens
     to be quiet, which is the same failure the summary line guards against.
+    `view_mode` is "table", "log" or "detail" -- `l` and `enter` change what is
+    on screen independently of sort/filter/quiet, so it needs saying too.
     """
     bits = [
         time.strftime("git-roost  %H:%M:%S"),
+        "view:%s" % view_mode,
         "sort:%s" % sort_mode,
         "filter:%s" % FILTER_LABELS[filt],
         "quiet:%s" % ("shown" if expand_quiet else "collapsed"),
@@ -969,7 +1104,7 @@ def scan(args):
     return collect(discover(roots, args.depth))
 
 
-def body(args, width, view=None):
+def body(args, width, view=None, changed=None):
     """One frame plus the states it was built from. `view` is the live watch
     state; None means the flags alone.
 
@@ -979,17 +1114,42 @@ def body(args, width, view=None):
     behind `git-roost | less` and `git-roost --json | jq`: keys move the watch
     view and nothing else. States come back alongside the lines so --fail-on
     can inspect the fleet without a second scan.
+
+    `changed` is forwarded to render() for the table view only -- see
+    frame_signature(). The watch loop computes it from frame to frame; the
+    one-shot path never has a previous frame to compare against.
     """
     states = scan(args)
     if args.json:
         return [json.dumps(states, indent=2, sort_keys=True)], states
-    if args.log is not None:
-        return render_log(states, args.log, width), states
     if view is None:
+        if args.log is not None:
+            return render_log(states, args.log, width), states
         return render(states, width, expand_quiet=args.all,
                       sort_mode=args.sort, filt=args.filter), states
+    return render_view(states, width, view, changed), states
+
+
+def render_view(states, width, view, changed=None):
+    """Render one already-scanned watch-mode frame from the live view state.
+
+    Split out of body() so the watch loop can reuse a single scan for both the
+    rendered frame and the cursor's row list, instead of scanning twice a
+    redraw.
+    """
+    if view.get("detail") is not None:
+        target = view["detail"]
+        # Watch mode rescans every interval; show the freshest state for that
+        # tree rather than freezing the frame it was opened on. If the tree
+        # has vanished (worktree removed mid-session), fall back to what was
+        # last known about it rather than crashing.
+        current = next((s for s in states if s["path"] == target["path"]), None)
+        return detail_lines(current or target, width)
+    if view.get("log"):
+        limit = view.get("log_limit") or 25
+        return render_log(states, limit, width)
     return render(states, width, expand_quiet=view["quiet"],
-                  sort_mode=view["sort"], filt=view["filter"]), states
+                  sort_mode=view["sort"], filt=view["filter"], changed=changed)
 
 
 def exit_code(states, fail_on):
@@ -1071,28 +1231,50 @@ def main(argv=None):
         return exit_code(states, args.fail_on)
 
     # Live view state, separate from args: the flags are the starting position
-    # and the keys move from there. --all seeds the quiet toggle and --sort/
-    # --filter seed the sort/filter, so `-a -w` opens expanded and `a` still
-    # collapses it, and the keys still cycle from wherever the flags started.
-    view = {"sort": args.sort, "filter": args.filter, "quiet": args.all}
+    # and the keys move from there. --all seeds the quiet toggle, --sort/
+    # --filter seed the sort/filter, and --log seeds the table/feed toggle, so
+    # `-a -w` opens expanded and `a` still collapses it, and `--log -w` opens
+    # on the feed and `l` still flips back.
+    view = {
+        "sort": args.sort, "filter": args.filter, "quiet": args.all,
+        "log": args.log is not None, "log_limit": args.log if args.log is not None else 25,
+        "cursor": 0, "detail": None,
+    }
     helping = False
     last_states = []
+    # Previous frame's (bucket, WORK, DRIFT) per tree path, for the "what
+    # moved" highlight. Empty on the first frame, so nothing is marked changed
+    # before there is anything to compare against.
+    prev_sig = {}
 
     try:
         with Keys() as keys:
             while True:
                 width = shutil.get_terminal_size((160, 24)).columns
-                if helping:
-                    out = help_lines()
+                states = scan(args)
+                last_states = states
+
+                if args.json:
+                    out = [json.dumps(states, indent=2, sort_keys=True)]
+                    shown = []
                 else:
-                    out, last_states = body(args, width, view)
+                    cur_sig = {s["path"]: frame_signature(s) for s in states}
+                    changed = {p for p, sig in cur_sig.items()
+                               if p in prev_sig and prev_sig[p] != sig}
+                    prev_sig = cur_sig
+                    out = help_lines() if helping else render_view(states, width, view, changed)
+                    shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
+
                 if ansi:
                     sys.stdout.write("\033[H\033[2J")
                 else:
                     # No VT support: a rule beats escape codes printed literally.
                     sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
+                view_mode = "detail" if view.get("detail") is not None else (
+                    "log" if view.get("log") else "table")
                 sys.stdout.write(status_line(
-                    view["sort"], view["filter"], view["quiet"], args.watch) + "\n\n")
+                    view["sort"], view["filter"], view["quiet"], args.watch,
+                    view_mode) + "\n\n")
                 sys.stdout.write("\n".join(out) + "\n")
                 sys.stdout.flush()
 
@@ -1105,7 +1287,13 @@ def main(argv=None):
                 if helping:
                     helping = False
                     continue
-                action = apply_key(view, key)
+                # Detail is its own overlay, dismissed by any key -- same
+                # pattern as help, one step above so apply_key never sees the
+                # keypress that closes it.
+                if view.get("detail") is not None:
+                    view["detail"] = None
+                    continue
+                action = apply_key(view, key, shown=shown)
                 if action == "quit":
                     break
                 helping = action == "help"

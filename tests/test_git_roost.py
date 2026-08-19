@@ -602,7 +602,8 @@ class TestWatchKeys(unittest.TestCase):
         # The map is what the `?` overlay prints. A key documented but not wired
         # would look like a broken feature rather than a missing one.
         documented = {k for k, _ in git_roost.KEYMAP}
-        self.assertEqual(documented, {"?", "r", "s", "f", "a", "q"})
+        self.assertEqual(
+            documented, {"?", "r", "s", "f", "a", "l", "j", "k", "enter", "q"})
 
     def test_help_overlay_lists_every_key(self):
         out = "\n".join(git_roost.help_lines())
@@ -730,6 +731,200 @@ class TestWatchKeys(unittest.TestCase):
             lines, states = git_roost.body(args, 200)
             self.assertEqual(lines, ["no git repositories found"])
             self.assertEqual(states, [])
+
+
+class TestCursorAndDetail(unittest.TestCase):
+    """j/k/enter: the row cursor and its detail view.
+
+    apply_key() needs the currently shown rows to keep the cursor sane, since
+    sort/filter/quiet can shrink or reorder the set out from under it between
+    keypresses.
+    """
+
+    def test_j_moves_down_and_stops_at_the_last_row(self):
+        shown = [renderable(repo="a"), renderable(repo="b"), renderable(repo="c")]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        for _ in range(5):  # more presses than rows, on purpose
+            git_roost.apply_key(view, "j", shown=shown)
+        self.assertEqual(view["cursor"], len(shown) - 1)
+
+    def test_k_moves_up_and_stops_at_zero(self):
+        # The bug this guards against: a naive decrement with no floor sends
+        # the cursor negative, which then indexes shown[-1] on `enter` --
+        # silently opening the wrong tree instead of doing nothing.
+        shown = [renderable(repo="a"), renderable(repo="b")]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        git_roost.apply_key(view, "k", shown=shown)
+        self.assertEqual(view["cursor"], 0)
+
+    def test_j_and_k_with_no_shown_rows_does_not_move_or_crash(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        git_roost.apply_key(view, "j", shown=[])
+        git_roost.apply_key(view, "k", shown=None)
+        self.assertEqual(view["cursor"], 0)
+
+    def test_changing_sort_resets_the_cursor(self):
+        # A cursor left at row 4 after a sort that now has only 2 rows on
+        # screen would either be silently clamped somewhere else or, worse,
+        # index past the end. Resetting on any view-shaping key sidesteps
+        # both.
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 3}
+        git_roost.apply_key(view, "s", shown=[renderable()])
+        self.assertEqual(view["cursor"], 0)
+
+    def test_enter_opens_the_row_under_the_cursor(self):
+        shown = [renderable(repo="a"), renderable(repo="b"), renderable(repo="c")]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 1}
+        git_roost.apply_key(view, "enter", shown=shown)
+        self.assertEqual(view["detail"]["repo"], "b")
+
+    def test_enter_with_no_shown_rows_opens_nothing(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        git_roost.apply_key(view, "enter", shown=[])
+        self.assertNotIn("detail", view)
+
+    def test_enter_clamps_a_cursor_left_over_from_a_wider_frame(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 9}
+        shown = [renderable(repo="only")]
+        git_roost.apply_key(view, "\r", shown=shown)
+        self.assertEqual(view["detail"]["repo"], "only")
+
+    @needs_git
+    def test_detail_view_shows_full_stash_list_for_a_tree_with_stashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            (repo / "f.txt").write_text("one\n")
+            run(repo, "add", "f.txt")
+            run(repo, "stash", "push", "-m", "wip one")
+            (repo / "f.txt").write_text("two\n")
+            run(repo, "add", "f.txt")
+            run(repo, "stash", "push", "-m", "wip two")
+
+            st = git_roost.tree_state(repo)
+            out = "\n".join(git_roost.detail_lines(st))
+            self.assertIn("wip one", out)
+            self.assertIn("wip two", out)
+            self.assertNotIn("(none)", out)
+
+    @needs_git
+    def test_detail_view_says_none_for_a_tree_with_no_stashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            st = git_roost.tree_state(repo)
+            out = "\n".join(git_roost.detail_lines(st))
+            self.assertIn("(none)", out)
+
+    @needs_git
+    def test_detail_view_includes_last_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            st = git_roost.tree_state(repo)
+            out = "\n".join(git_roost.detail_lines(st))
+            self.assertIn("initial", out)
+
+    @needs_git
+    def test_detail_view_shows_operation_in_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            (repo / "f.txt").write_text("base\n")
+            run(repo, "add", "f.txt")
+            run(repo, "commit", "-m", "base")
+            run(repo, "checkout", "-b", "side")
+            (repo / "f.txt").write_text("side\n")
+            run(repo, "add", "f.txt")
+            run(repo, "commit", "-m", "side")
+            run(repo, "checkout", "main")
+            (repo / "f.txt").write_text("main\n")
+            run(repo, "add", "f.txt")
+            run(repo, "commit", "-m", "main")
+            subprocess.run(("git", "merge", "side"), cwd=str(repo),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            st = git_roost.tree_state(repo)
+            out = "\n".join(git_roost.detail_lines(st))
+            self.assertIn("merge in progress", out)
+
+
+class TestChangeHighlighting(unittest.TestCase):
+    """Frame-to-frame change marking: what a top-style tool owes a watcher."""
+
+    def test_frame_signature_changes_when_bucket_changes(self):
+        clean = renderable(repo="a", tracked=0)
+        dirty = renderable(repo="a", tracked=3)
+        self.assertNotEqual(git_roost.frame_signature(clean), git_roost.frame_signature(dirty))
+
+    def test_frame_signature_is_stable_for_an_identical_state(self):
+        a = renderable(repo="a", tracked=1, untracked=2, ahead=1, behind=0, base="origin/main")
+        b = renderable(repo="a", tracked=1, untracked=2, ahead=1, behind=0, base="origin/main")
+        self.assertEqual(git_roost.frame_signature(a), git_roost.frame_signature(b))
+
+    def test_frame_signature_ignores_last_ts_alone(self):
+        # LAST ticks every second in watch mode. If the signature included it,
+        # every row would show as "changed" on every redraw, which defeats the
+        # entire point of a change marker.
+        a = renderable(repo="a", last_ts=1000)
+        b = renderable(repo="a", last_ts=2000)
+        self.assertEqual(git_roost.frame_signature(a), git_roost.frame_signature(b))
+
+    def test_render_marks_a_changed_row_and_not_an_unchanged_one(self):
+        # tracked=1 keeps both rows out of the collapsed QUIET group, which
+        # would otherwise fold them into one summary line with no per-row
+        # marker to assert on.
+        unchanged = renderable(repo="a", path="/p/a", tracked=1)
+        row_changed = renderable(repo="b", path="/p/b", tracked=1)
+        rows = [unchanged, row_changed]
+        out = git_roost.render(rows, width=200, changed={"/p/b"})
+        # The marker is a fixed two-char prefix ("* " or "  "); the REPO cell
+        # right after it starts immediately with the repo name. COLOR is off
+        # in the test process (no terminal), so there are no escapes to strip.
+        a_line = next(l for l in out if l[2:].startswith("a"))
+        b_line = next(l for l in out if l[2:].startswith("b"))
+        self.assertTrue(a_line.startswith("  "))
+        self.assertTrue(b_line.startswith("* "))
+
+    def test_render_without_changed_marks_nothing(self):
+        rows = [renderable(repo="a", path="/p/a")]
+        out = "\n".join(git_roost.render(rows, width=200))
+        self.assertNotIn("*", out)
+
+
+class TestLogToggle(unittest.TestCase):
+    """`l`: flip watch mode between the fleet table and the commit feed."""
+
+    def test_l_toggles_log_both_ways(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "log": False, "cursor": 0}
+        git_roost.apply_key(view, "l")
+        self.assertTrue(view["log"])
+        git_roost.apply_key(view, "l")
+        self.assertFalse(view["log"])
+
+    @needs_git
+    def test_render_view_shows_the_feed_when_log_is_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            states = git_roost.collect(git_roost.discover([Path(tmp)]))
+            view = {"sort": "recent", "filter": "all", "quiet": False,
+                    "log": True, "log_limit": 25, "cursor": 0, "detail": None}
+            out = "\n".join(git_roost.render_view(states, 200, view))
+            self.assertIn("initial", out)
+            self.assertIn("AGE", out)  # render_log's header, not render()'s
+
+    @needs_git
+    def test_render_view_shows_the_table_when_log_is_unset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            states = git_roost.collect(git_roost.discover([Path(tmp)]))
+            view = {"sort": "recent", "filter": "all", "quiet": False,
+                    "log": False, "log_limit": 25, "cursor": 0, "detail": None}
+            out = "\n".join(git_roost.render_view(states, 200, view))
+            self.assertIn("WORK", out)  # render()'s header, not render_log's
+
+    def test_render_view_shows_detail_when_set(self):
+        st = renderable(repo="a", path="/p/a")
+        view = {"sort": "recent", "filter": "all", "quiet": False,
+                "log": False, "log_limit": 25, "cursor": 0, "detail": st}
+        out = "\n".join(git_roost.render_view([st], 200, view))
+        self.assertIn("LAST 5 COMMITS", out)
 
 
 class TestCli(unittest.TestCase):
