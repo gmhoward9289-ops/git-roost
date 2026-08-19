@@ -53,28 +53,77 @@ else
   printf '  ok    %-24s dynamic (from git_roost.py)\n' "pyproject.toml"
 fi
 
-# --- Homebrew formula, once it exists ----------------------------------------
-# The repo has no remote yet, so there is no tarball URL to pin and no formula.
-# Absence is fine; a formula that exists and disagrees is not. Do not "fix" this
-# by writing a placeholder URL or a placeholder hash -- a formula pinned to a URL
-# that 404s, or to a sha256 that doesn't match, fails at install time rather than
-# here, which is the failure mode this whole script exists to prevent.
-if [ -f packaging/git-roost.rb ]; then
-  rb_version=$(sed -n 's#.*url "https://github.com/[^"]*/archive/refs/tags/v\([^"]*\)\.tar\.gz".*#\1#p' \
-               packaging/git-roost.rb)
-  report "git-roost.rb url tag" "$rb_version" "$VERSION"
-  rb_hint=$(sed -n 's#.*curl -sL https://github.com/[^ ]*/archive/refs/tags/v\([0-9][^ ]*\)\.tar\.gz.*#\1#p' \
-            packaging/git-roost.rb | head -1)
-  report "git-roost.rb curl comment" "$rb_hint" "$VERSION"
+# --- npm package: a literal version, padded to three components --------------
+# npm rejects a two-component version outright, so package.json cannot simply
+# copy git_roost.py. Compare against the padded form rather than exempting the
+# file -- "exempt" would mean 0.1.0 could sit there forever after git_roost.py
+# moved on. The padding branch is a no-op while git_roost.py carries three
+# components (release-please's parser hard-fails on two, so it must), but it is
+# what makes this check survive a future slip back to a two-component version.
+case $VERSION in
+  *.*.*) NPM_WANT=$VERSION ;;
+  *.*)   NPM_WANT=$VERSION.0 ;;
+  *)     NPM_WANT=$VERSION.0.0 ;;
+esac
+npm_version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+              package.json | head -1)
+report "package.json version" "$npm_version" "$NPM_WANT"
 
-  # The tag is only half the pin. Checking the URL alone would pass a formula
+# --- Homebrew formula ---------------------------------------------------------
+# The version appears in the formula EXACTLY ONCE, on the `version` line; the
+# url interpolates it for both the tag and the filename. That shape is not
+# cosmetic -- roost embedded the version twice on its url line, a bump rewrote
+# only the first occurrence, and the release shipped a url whose tag said the
+# new version while its filename still said the old one. So the url check here
+# is structural: assert the interpolation is present, rather than parsing a
+# literal that should not exist in the first place.
+if [ -f packaging/git-roost.rb ]; then
+  rb_version=$(sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' packaging/git-roost.rb)
+  report "git-roost.rb version" "$rb_version" "$VERSION"
+
+  # The url must point at the sdist uploaded to the GitHub Release, not at
+  # GitHub's archive/refs/tags/ URL. That URL is not a release asset, so GitHub
+  # never counts `brew install` traffic in the repo's release download_count --
+  # roost's entire Homebrew audience was invisible until this changed there.
+  #
+  # The filename normalises git-roost to git_roost (PEP 625, applied by
+  # hatchling). Asserted here as well as written in the formula because a hyphen
+  # there produces a URL that 404s at `brew install` time, which is exactly the
+  # class of failure this script exists to catch before a tag goes out.
+  if grep -qE '^[[:space:]]*url ".*/releases/download/v#\{version\}/git_roost-#\{version\}\.tar\.gz"' \
+       packaging/git-roost.rb; then
+    printf '  ok    %-24s release-asset sdist, interpolated\n' "git-roost.rb url"
+  else
+    echo "  DRIFT git-roost.rb url          want .../releases/download/v#{version}/git_roost-#{version}.tar.gz" >&2
+    echo "        (archive/refs/tags/ is not a release asset, so brew installs go uncounted)" >&2
+    fail=1
+  fi
+
+  # No other version literal may appear anywhere in the formula -- one copy, on
+  # the `version` line, is the whole design, and a stale number in the curl hint
+  # comment is how that design quietly rots. python@3.x interpreter pins and the
+  # Apache-2.0 SPDX id are not release versions; exclude them.
+  rb_literals=$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' packaging/git-roost.rb \
+                | grep -vxE '3\.[0-9]+|2\.0' | sort -u | tr '\n' ' ') || rb_literals=""
+  # The `|| rb_literals=""` matters: under `set -o pipefail` a formula with no
+  # version literal at all would make grep exit 1 and kill this script with no
+  # output -- the empty case has to reach report() and be named, not vanish.
+  rb_literals=${rb_literals% }
+  report "git-roost.rb literals" "$rb_literals" "$VERSION"
+
+  # The version is only half the pin. Checking it alone would pass a formula
   # whose sha256 is a placeholder or a stale paste -- green here, broken at
   # `brew install`. Shape first, because it costs nothing and catches the
   # placeholder case offline.
   # Capture whatever is between the quotes, not just hex -- otherwise a
   # placeholder like REPLACE_ME captures as empty and reports "<missing>",
   # which sends you looking for an absent line rather than a wrong one.
-  rb_sha=$(sed -n 's/.*sha256 "\([^"]*\)".*/\1/p' packaging/git-roost.rb | head -1)
+  # Anchored to the start of the line rather than an unanchored '.*sha256':
+  # the formula's header comment names the sha256 line when explaining what the
+  # release workflow rewrites, and an unanchored match reads that prose instead
+  # of the directive -- reporting a malformed digest for a formula whose digest
+  # is fine.
+  rb_sha=$(sed -n 's/^[[:space:]]*sha256 "\([^"]*\)".*/\1/p' packaging/git-roost.rb | head -1)
   if printf '%s' "$rb_sha" | grep -qE '^[0-9a-f]{64}$'; then
     printf '  ok    %-24s well-formed\n' "git-roost.rb sha256"
   else
@@ -83,23 +132,91 @@ if [ -f packaging/git-roost.rb ]; then
     fail=1
   fi
 
-  # Then the real check: does that digest actually match the tarball? This is
-  # the one that would have caught roost shipping a stale formula. Needs the
-  # network, so it degrades to an explicit skip -- never to a silent pass.
-  rb_url=$(sed -n 's/.*url "\([^"]*\)".*/\1/p' packaging/git-roost.rb | head -1)
-  if [ -n "$rb_url" ] && command -v curl >/dev/null 2>&1; then
+  # Finally, report the in-repo digest against the published sdist. REPORT, not
+  # gate: this whole block is informational and can never set fail. The 200 case
+  # below explains why that is forced rather than lenient, and why the check the
+  # script was actually written for still fails offline, above.
+  #
+  # It needs the network, so it degrades to an explicit skip -- never to a
+  # silent pass. The reasons it can fail to fetch are not the same thing, and
+  # saying which one happened matters. "No release asset yet" is the expected
+  # state before the first tag: not a problem, but it does mean the sha256 is
+  # UNVERIFIED and the release workflow must recompute it before the tap-push
+  # job copies the formula. Collapsing that into one vague "could not fetch"
+  # alongside "you are offline" is how an unverified hash reaches a user.
+  rb_url=$(sed -n 's/^[[:space:]]*url "\([^"]*\)".*/\1/p' packaging/git-roost.rb | head -1)
+  rb_url=${rb_url//'#{version}'/$VERSION}
+  if [ -z "$rb_url" ]; then
+    printf '  DRIFT %-24s no url line\n' "git-roost.rb url" >&2
+    fail=1
+  elif ! command -v curl >/dev/null 2>&1; then
+    printf '  --    %-24s no curl; cannot verify %s\n' "git-roost.rb sha256" "$rb_url"
+  else
     tmp=$(mktemp)
-    if curl -sfL --max-time 60 "$rb_url" -o "$tmp" 2>/dev/null; then
-      actual=$(shasum -a 256 "$tmp" | cut -d' ' -f1)
-      report "git-roost.rb sha256 vs tarball" "$actual" "$rb_sha"
-    else
-      printf '  --    %-24s could not fetch %s (offline, or the tag does not exist)\n' \
-        "git-roost.rb tarball" "$rb_url"
-    fi
+    code=$(curl -sL --max-time 60 -o "$tmp" -w '%{http_code}' "$rb_url" 2>/dev/null) || code=000
+    case "$code" in
+      200)
+        # The asset exists. Compare -- but NEVER gate on the result, because a
+        # mismatch here is the normal, structurally guaranteed state, not drift.
+        #
+        # The sdist ships packaging/ (see [tool.hatch.build.targets.sdist] in
+        # pyproject.toml), so git-roost.rb is INSIDE the tarball being hashed.
+        # Writing the asset's true digest into the formula changes the tarball,
+        # which changes the digest. "The formula's sha256 equals the hash of an
+        # sdist containing that same sha256" is a hash fixed point: not
+        # findable, so on the commit a release is cut from these two values
+        # cannot agree. Failing the build on that would mean demanding the
+        # impossible.
+        #
+        # It also made release.yml un-re-runnable: a re-run for an
+        # already-published tag (retrying after npm or the tap failed on a
+        # one-time-setup gap) fetches 200, compared stale-vs-real, exited 1, and
+        # killed the build job before anything downstream could retry -- exactly
+        # when a re-run matters most.
+        #
+        # Nothing is lost by not gating here, and this is the part worth being
+        # clear about. The case this script was written for -- a formula left
+        # behind on an OLDER release -- is caught by the `git-roost.rb version`
+        # and `git-roost.rb literals` checks above, which compare against
+        # __version__ directly, offline, and DO fail. The digest never carried
+        # that signal. And the digest users actually install is not this one:
+        # the homebrew-tap job in release.yml computes sha256sum over the local
+        # sdist, rewrites the formula, and asserts the value it wrote before
+        # pushing to the tap. That job is the authority; this line is a report.
+        actual=$(shasum -a 256 "$tmp" | cut -d' ' -f1)
+        if [ "$actual" = "$rb_sha" ]; then
+          # Reachable, and good news when it happens: a post-release commit that
+          # refreshed the digest for an already-published tag. Then -- and only
+          # then -- the in-repo formula is accurate documentation of what shipped.
+          printf '  ok    %-24s matches the published sdist\n' "git-roost.rb sha256"
+        else
+          printf '  --    %-24s differs from the published sdist, which is expected:\n' \
+            "git-roost.rb sha256"
+          printf '        the sdist contains this file, so the digest cannot match itself.\n'
+          printf '        published %s\n' "$actual"
+          printf '        in repo   %s\n' "$rb_sha"
+          printf '        The homebrew-tap job computes and asserts the real one at push time.\n'
+        fi
+        ;;
+      404)
+        printf '  --    %-24s UNVERIFIED -- no release asset at\n' "git-roost.rb sha256"
+        printf '        %s\n' "$rb_url"
+        printf '        so the digest in the formula is a stand-in. The release workflow\n'
+        printf '        must recompute it on the next tag, before the tap-push job runs.\n'
+        ;;
+      *)
+        printf '  --    %-24s could not fetch (HTTP %s -- offline?) %s\n' \
+          "git-roost.rb sha256" "$code" "$rb_url"
+        ;;
+    esac
     rm -f "$tmp"
   fi
 else
-  # The remote exists; what is missing is a tag to hash. See the note in README.
+  # A formula that exists and disagrees is worse than none. Do not "fix" an
+  # absent one by writing a placeholder URL or a placeholder hash -- a formula
+  # pinned to a URL that 404s, or to a sha256 that doesn't match, fails at
+  # install time rather than here, which is the failure mode this whole script
+  # exists to prevent.
   printf '  --    %-24s not written yet (no release tag to pin)\n' "packaging/git-roost.rb"
 fi
 
@@ -109,6 +226,7 @@ if [ "$fail" -ne 0 ]; then
 Version drift. Every artifact above must say $VERSION.
 
   git-roost.1   .TH GIT-ROOST 1 "<date>" "git-roost $VERSION" "User Commands"
+  package.json  "version": "$NPM_WANT"   (npm needs three components)
 
 EOF
   exit 1
