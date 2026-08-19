@@ -1,0 +1,359 @@
+name: release
+
+# The back half of releasing. release-please.yml is the front half: merging its
+# release PR bumps every version-bearing artifact and pushes the `v*` tag that
+# starts this workflow. Nothing here decides a version -- it only publishes the
+# one already committed, and refuses to publish if the artifacts disagree about
+# what it is.
+#
+# Channels, in the order they are set up:
+#   PyPI      -- as the bare name `git-roost` (unlike roost, which had to become
+#                roost-top; see the comment at the top of pyproject.toml).
+#   npm       -- also `git-roost`, wrapping the same script via bin/git-roost.js.
+#   Homebrew  -- packaging/git-roost.rb copied into gmhoward9289-ops/homebrew-tap
+#                with a checksum computed from the sdist this run just uploaded.
+#
+# The .deb is built and attached to the release, so `sudo apt install
+# ./git-roost_<version>_all.deb` works. It is deliberately NOT pushed into a
+# hosted apt repo -- see the note where roost's apt-repo job would go, below.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Build wheel and sdist
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Build the .deb
+        run: packaging/build-deb.sh
+
+      # __version__ in git_roost.py is the single source the whole toolchain
+      # reads (hatch, build-deb.sh, the CLI). A tag that disagrees with it would
+      # publish a wheel named for one version hanging off a release named for
+      # another, and `pip install git-roost==<tag>` would 404 while the release
+      # page looks perfectly fine.
+      - name: Check the tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          code_version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' git_roost.py)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$code_version" != "$tag_version" ]; then
+            echo "::error::tag $tag_version != __version__ $code_version" >&2
+            exit 1
+          fi
+
+      # The man page header and the Homebrew formula embed the version as
+      # literal text rather than deriving it, and neither failure is loud: `man
+      # git-roost` simply disagrees with `git-roost --version`, and a stale
+      # formula passes its own version assertion because Homebrew reads the
+      # version from the same stale line it ships. roost lost a release to
+      # exactly this at v0.3. ci.yml runs this script on every PR; repeating it
+      # here makes a tag build refuse to publish a mismatch that arrived some
+      # other way -- a hand-pushed tag, or a release PR someone hand-edited.
+      #
+      # Its network half (formula sha256 vs the tarball at that URL) reports an
+      # explicit skip rather than a failure when the URL 404s, which is the
+      # normal state here: the release asset the formula points at is uploaded
+      # further down this same job, so it does not exist yet when this runs.
+      - name: Check the man page and Homebrew formula match __version__
+        run: packaging/check-version-consistency.sh
+
+      # package.json is the one artifact release-please bumps natively -- the
+      # node release-type owns it -- rather than through extra-files. So it is
+      # also the one that would silently keep its own number if the config ever
+      # stopped covering this package, and npm would publish a version that
+      # exists on no other channel under the same name.
+      - name: Check package.json matches __version__
+        run: |
+          set -euo pipefail
+          code_version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' git_roost.py)
+          pkg_version=$(node -p 'require("./package.json").version')
+          if [ "$code_version" != "$pkg_version" ]; then
+            echo "::error::package.json says $pkg_version, git_roost.py says $code_version" >&2
+            exit 1
+          fi
+
+      # PEP 440 silently rewrites a version like "0.02" into "0.2", so the wheel
+      # and sdist filenames can disagree with the tag, the .deb and the man page
+      # without anything else noticing -- every other artifact takes the string
+      # verbatim. Nothing in the current scheme trips this; the check is here so
+      # that the day someone picks a version PEP 440 rewrites, the release stops
+      # instead of shipping four artifacts under three different version
+      # strings.
+      - name: Check the wheel filename matches the version
+        run: |
+          set -euo pipefail
+          code_version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' git_roost.py)
+          wheel_version=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
+          echo "version / tag / deb / man : $code_version"
+          echo "wheel and sdist           : $wheel_version"
+          if [ "$code_version" != "$wheel_version" ]; then
+            echo "::error::PEP 440 rewrote $code_version to $wheel_version; pick a canonical version" >&2
+            exit 1
+          fi
+
+      # A wheel that builds can still install to a broken console script: the
+      # entry point name, the module name and the shared-data man page path are
+      # three separate strings in pyproject.toml, and only an actual install
+      # proves they line up. --once because there is no TTY on a runner and the
+      # watch loop would never exit.
+      - name: Verify the built package actually runs
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --quiet dist/*.whl
+          /tmp/v/bin/git-roost --version
+          /tmp/v/bin/git-roost --once --no-color
+          test -f /tmp/v/share/man/man1/git-roost.1
+
+      # dpkg-deb will happily build a package dpkg then refuses to install, and
+      # the man page is the part most likely to be wrong without being noticed:
+      # it is gzipped into a path nothing else reads. `man -w` is the cheap
+      # proof that man-db can resolve the page after a real install, not merely
+      # that some file landed somewhere under /usr/share.
+      - name: Verify the .deb installs and the man page is readable
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y ./dist/git-roost_*_all.deb
+          git-roost --version
+          man -w git-roost
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dist
+          path: dist/*
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Pushing a tag does not create a GitHub Release, so uploading straight
+        # to one fails on a plain `git push --tags`. Create it if it is not there
+        # and upload either way, so the tag is the only step a release needs.
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+  # Publishes the tagged build to PyPI via trusted publishing (OIDC): PyPI
+  # trusts this repo's release.yml through the "pypi" environment, so no API
+  # token exists anywhere -- not in this repo's secrets, not on a laptop. There
+  # is nothing to leak and nothing to rotate.
+  #
+  # ONE-TIME SETUP this job depends on and cannot do for itself: on PyPI, under
+  # the account's Publishing page, add a *pending* publisher for the project
+  # name `git-roost` -- owner gmhoward9289-ops, repository git-roost, workflow
+  # release.yml, environment `pypi`. Pending (rather than "existing project") is
+  # the right kind because the name has never been published; PyPI creates the
+  # project on the first successful upload, which also claims the bare name.
+  # Create the `pypi` GitHub Environment here too -- unprotected is fine, it
+  # exists to give the pairing a name both sides agree on. Until that
+  # registration exists this job fails alone with an OIDC error; the release,
+  # its assets, npm and the tap all still land.
+  pypi:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: dist
+      # The build job's artifact carries the .deb as well, and
+      # gh-action-pypi-publish uploads the whole directory -- an unfiltered
+      # dist/ fails the run on a file PyPI was never going to accept.
+      - name: Drop the .deb -- PyPI takes wheels and sdists only
+        run: rm -f dist/*.deb
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  # Publishes to npm as `git-roost` via trusted publishing (OIDC), the same
+  # no-token pattern as the pypi job above: npmjs.com trusts this exact repo +
+  # workflow file through a registered Trusted Publisher, so `npm publish`
+  # requests a short-lived credential instead of reading a stored secret. Needs
+  # npm CLI >= 11.5.1 for OIDC, which the npm bundled with actions/setup-node
+  # can lag behind -- upgraded explicitly rather than assumed.
+  #
+  # ONE-TIME SETUP this job depends on and cannot do for itself: on
+  # https://www.npmjs.com/package/git-roost/access, add a Trusted Publisher ->
+  # GitHub Actions pointing at gmhoward9289-ops/git-roost, workflow file
+  # release.yml, environment `npm` (create that GitHub Environment here too).
+  # npm only offers that screen for a package that already exists, so the very
+  # first version has to be published by hand from a logged-in session; every
+  # version after that goes through this job. Until then it fails alone and PyPI
+  # and the tap still publish.
+  npm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install -g npm@latest
+      - run: npm publish
+
+  # Publishes packaging/git-roost.rb (this repo's master copy) into the tap repo
+  # (gmhoward9289-ops/homebrew-tap) as Formula/git-roost.rb, with a sha256
+  # computed from the sdist this run just uploaded. Refreshing that checksum by
+  # hand is precisely how roost shipped a v0.3 whose formula still pointed at
+  # the v0.2 tarball -- and that failure is invisible, because Homebrew checks
+  # the stale version against the stale tarball, agrees with itself, and
+  # installs the previous release with every check green.
+  #
+  # ONE-TIME SETUP this job depends on and cannot do for itself: a
+  # TAP_PUSH_TOKEN secret on this repo -- a fine-grained PAT scoped to
+  # gmhoward9289-ops/homebrew-tap with Contents: Read and write. The default
+  # GITHUB_TOKEN only ever carries permission inside this repo, never a second
+  # one, so without the PAT the tap checkout below fails immediately.
+  homebrew-tap:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo (for packaging/git-roost.rb)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: src
+
+      - name: Check out the tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: gmhoward9289-ops/homebrew-tap
+          ref: master
+          path: tap
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: dist
+
+      # Points at the sdist uploaded to the GitHub Release by the build job, not
+      # GitHub's auto-generated archive/refs/tags/ URL: that URL is not a release
+      # asset at all, so GitHub does not count `brew install` fetches in the
+      # repo's release download_count the way it does for the .whl and the .deb.
+      # Hashing the local file rather than re-downloading also means the digest
+      # is of the exact bytes that were uploaded, with no window in which the
+      # asset could differ from what was hashed.
+      - name: Compute the release asset checksum
+        run: |
+          set -euo pipefail
+          sdist=$(ls dist/*.tar.gz)
+          version="${GITHUB_REF_NAME#v}"
+          url="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/$(basename "$sdist")"
+          sha256=$(sha256sum "$sdist" | cut -d' ' -f1)
+          echo "URL=$url" >> "$GITHUB_ENV"
+          echo "SHA256=$sha256" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # Only two lines are rewritten. The formula's url is built from #{version}
+      # rather than hardcoded, so rewriting `version` moves the url with it; the
+      # explicit version line exists because Homebrew cannot parse a version out
+      # of a release-asset path the way it can out of an archive/refs/tags/ one,
+      # and would otherwise call this formula versionless. The sha256 cannot be
+      # derived from anything and is the line release-please has no way to bump,
+      # which is exactly why it used to be a "remember to refresh it" comment
+      # and exactly how roost shipped a stale one.
+      #
+      # sed says nothing when a pattern matches nothing, so a formula whose
+      # `version` or `sha256` line ever changes shape would be copied across
+      # untouched and push this tag's number beside the previous tag's digest.
+      # The asserts below turn that into a failed release rather than a `brew
+      # install` that dies on a checksum mismatch in someone else's terminal.
+      # The url is checked by resolving #{version} the same way Homebrew will,
+      # which catches both a hardcoded url left behind and a template edited
+      # into the wrong asset path.
+      - name: Write the formula with this release's checksum and version
+        run: |
+          set -euo pipefail
+          # Every pattern here is anchored at start-of-line and bounded by the
+          # closing quote, both deliberately. The formula's header comment
+          # discusses `sha256 "..."` and `version "..."` in prose; an unanchored
+          # match rewrites that prose instead of the directive, and a greedy
+          # `".*"` would swallow the `# x-release-please-version` marker off the
+          # end of the version line -- which is the marker release-please needs
+          # to bump it at all, so the next release would silently stop updating
+          # the formula.
+          sed -e "s#^\([[:space:]]*\)sha256 \"[^\"]*\"#\1sha256 \"$SHA256\"#" \
+              -e "s#^\([[:space:]]*\)version \"[^\"]*\"#\1version \"$VERSION\"#" \
+              src/packaging/git-roost.rb > tap/Formula/git-roost.rb
+          fail=0
+          # Compare extracted values, never whole lines -- same reason: a
+          # whole-line match would fail on the trailing marker comment rather
+          # than on the version it is supposed to be checking.
+          got_version=$(sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' tap/Formula/git-roost.rb | head -1)
+          if [ "$got_version" != "$VERSION" ]; then
+            echo "::error::formula version is '${got_version:-<no version line>}', want $VERSION -- Homebrew cannot derive a version from a release-asset url, so packaging/git-roost.rb needs an explicit version line for sed to rewrite"
+            fail=1
+          fi
+          got_sha=$(sed -n 's/^[[:space:]]*sha256 "\([^"]*\)".*/\1/p' tap/Formula/git-roost.rb | head -1)
+          if [ "$got_sha" != "$SHA256" ]; then
+            echo "::error::formula sha256 is '${got_sha:-<no sha256 line>}', want $SHA256 -- check the line's shape in packaging/git-roost.rb"
+            fail=1
+          fi
+          # The in-repo formula's sha256 is knowingly stale between releases --
+          # there is nothing to hash until the asset exists, so it can only ever
+          # be recomputed here. If this assert passes on a digest that was
+          # already in the file, that is a coincidence, not a skipped rewrite.
+          formula_url=$(sed -n 's/^[[:space:]]*url "\([^"]*\)".*/\1/p' tap/Formula/git-roost.rb | head -1)
+          resolved_url=${formula_url//'#{version}'/$VERSION}
+          if [ "$resolved_url" != "$URL" ]; then
+            echo "::error::formula url resolves to $resolved_url, but the asset uploaded to this release is $URL"
+            fail=1
+          fi
+          exit "$fail"
+
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name "git-roost-release-bot"
+          git config user.email "dev@swamplink.com"
+          git add Formula/git-roost.rb
+          git diff --cached --quiet && echo "nothing changed" || git commit -m "git-roost $GITHUB_REF_NAME"
+          git push origin master
+
+  # DELIBERATELY ABSENT: the apt-repo job roost has at this point.
+  #
+  # roost publishes its .deb into a signed apt repo on its own gh-pages branch,
+  # so users get `sudo apt install roost` and `apt upgrade` rather than a
+  # one-shot download. Porting it is not a copy job: it needs a dedicated
+  # sign-only GPG key generated for this repo, that key's private half stored as
+  # a secret, its public half committed as packaging/apt/pubkey.asc and
+  # published as the keyring users import, a bootstrapped gh-pages branch, and
+  # GitHub Pages enabled against it. Getting the key wrong is not a failed
+  # build; it is a keyring people have already imported and now have to be told
+  # to re-import.
+  #
+  # Issue #7 scopes this out on purpose -- PyPI plus the tap is the useful
+  # minimum, and the signing key is a separate decision. Until it is made the
+  # .deb is still built, still asserted to install cleanly with a readable man
+  # page, and still attached to every release above, so
+  # `sudo apt install ./git-roost_<version>_all.deb` works. It just does not
+  # update itself.

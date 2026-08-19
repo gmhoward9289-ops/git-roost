@@ -1,5 +1,10 @@
 # git-roost
 
+[![ci](https://github.com/gmhoward9289-ops/git-roost/actions/workflows/ci.yml/badge.svg)](https://github.com/gmhoward9289-ops/git-roost/actions/workflows/ci.yml)
+[![pypi](https://img.shields.io/pypi/v/git-roost)](https://pypi.org/project/git-roost/)
+[![npm](https://img.shields.io/npm/v/git-roost)](https://www.npmjs.com/package/git-roost)
+[![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 `top` for git — every repo and worktree on the box, in one table, most
 actionable first.
 
@@ -31,6 +36,32 @@ QUIET (8)  blog/chicken-fest . copilot-money-mcp/(primary) . repo-security-ci/(p
 27 tree(s) across 11 repo(s)  |  2 with uncommitted work  |  1 mid-operation
 ```
 
+## Install
+
+The distribution, the command, the module and the repo are all the bare
+`git-roost` — pick whichever channel is already on the box.
+
+```bash
+pipx install git-roost          # or: pip install --user git-roost
+npm install -g git-roost        # if Node is what you have
+brew install gmhoward9289-ops/tap/git-roost
+```
+
+Or just take the file. It is one script with no dependencies, so `curl` and
+`chmod +x` is a complete install:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/gmhoward9289-ops/git-roost/main/git_roost.py
+chmod +x git_roost.py && ./git_roost.py
+```
+
+Installed under any of those names, `git roost` works too: git dispatches an
+unknown subcommand to a `git-<name>` on PATH.
+
+The man page installs to `<prefix>/share/man/man1`. A system or Homebrew install
+puts that on the default MANPATH; a venv or pipx install does not, so `man
+git-roost` there needs `MANPATH` help.
+
 ## Why
 
 `lazygit`, `gitui` and `tig` are all excellent and all single-repo. They answer
@@ -50,6 +81,27 @@ git-roost --all          # expand the QUIET group
 git-roost --json         # records, for piping somewhere else
 git-roost --root ~/src   # look somewhere other than ~/GitHub (repeatable)
 ```
+
+Watch mode takes keys:
+
+| Key | Action |
+|---|---|
+| `?` | the keymap |
+| `r` | refresh now |
+| `s` | sort: recent / repo / work |
+| `f` | filter: all / uncommitted / mid-operation |
+| `a` | expand or collapse `QUIET` |
+| `q` | quit |
+
+Sort cycles *within* a group and never across one. The group order is the whole
+argument this tool makes — cost of ignoring, not recency or size — so a sort
+that let an `ACTIVE` tree float above a `MID-OPERATION` one would be quietly
+answering a different question.
+
+Keys need a terminal. Piped, redirected, or on a box with neither `termios` nor
+`msvcrt`, watch mode degrades to the plain timer redraw rather than failing, and
+the default one-shot render touches no terminal settings at all — which is what
+keeps `git-roost | less` and `git-roost --json | jq` safe.
 
 ## Reading the table
 
@@ -95,6 +147,21 @@ and an origin-only lookup filed a tree that was nine commits behind under QUIET.
 Step 3 stops at a single remote on purpose. With two remotes there is no way to
 know which is authoritative, and a confident wrong baseline is worse than `-`.
 
+## Configuration
+
+Two environment variables, both about how hard to push a slow disk rather than
+about git.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `GIT_ROOST_TIMEOUT` | `5` | seconds any single git call may take before it is abandoned |
+| `GIT_ROOST_WORKERS` | `12` | how many trees are scanned in parallel |
+
+The timeout is a ceiling on one call, not on the scan. A tree behind a stalled
+network mount is dropped rather than allowed to hold the whole table hostage —
+in a watch loop, one unreachable repo would otherwise stop every other repo from
+redrawing.
+
 ## Read-only by construction
 
 Every git invocation goes through one function that refuses anything outside an
@@ -123,6 +190,24 @@ refs) are computed once per repo rather than once per worktree.
 Measured on 27 trees across 11 repos: **~0.68s** per redraw, comfortably inside
 the default 3s watch interval. Tunable with `GIT_ROOST_WORKERS` and
 `GIT_ROOST_TIMEOUT`.
+
+## The family
+
+Four tools, one shape: single file, no dependencies, stdlib `unittest`, and a
+table ordered by what it costs to ignore.
+
+- **[roost](https://github.com/gmhoward9289-ops/roost)** — `top` for Claude
+  Code: per-session context burn, models, and the subagents a session spawned.
+- **git-roost** — this one. The other half of the same question: not what the
+  sessions say they are doing, but what their trees actually contain.
+- **[leghorn](https://github.com/gmhoward9289-ops/leghorn)** — sessions joined
+  to worktrees and real git state, CI, and a commit feed.
+- **[legbar](https://github.com/gmhoward9289-ops/legbar)** — both lanes on one
+  screen, over one discovery layer.
+
+`git-roost` is the one that needs no Claude Code, no sessions and no
+`~/.claude` at all. It reads git and nothing else, which is why it is the one
+worth running on a box that has never seen an agent.
 
 ## Tests
 

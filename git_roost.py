@@ -17,6 +17,10 @@ uncommitted work nobody has looked at, who is stuck mid-rebase.
     git-roost --all          # expand the QUIET group
     git-roost --json         # records, for piping somewhere else
 
+Watch mode takes keys -- `?` for the map, `r` refresh, `s` sort, `f` filter, `a`
+quiet, `q` quit. The default one-shot render takes none and touches no terminal
+settings at all, which is what keeps it safe to pipe.
+
 One file, no dependencies, Python 3.9+, macOS/Linux/Windows -- the same
 constraints as roost, for the same reason: it has to run on whatever Python is
 already on the box, including a bare system 3.9 on macOS.
@@ -41,7 +45,32 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "0.1"
+# Raw single-key reads in watch mode. curses would have been the obvious choice
+# -- leghorn and legbar both use it -- but curses is not in the Windows stdlib,
+# and git-roost claims Windows in its classifiers. So the two halves are
+# imported conditionally and the watch loop uses whichever it got; a box with
+# neither simply keeps the old timer-only redraw.
+try:
+    import msvcrt  # Windows
+except ImportError:
+    msvcrt = None
+try:
+    import select
+    import termios
+    import tty  # POSIX
+except ImportError:
+    termios = None
+
+# release-please rewrites the line between these markers. It only touches a
+# version inside an annotation, so without them the release PR bumps
+# package.json, leaves this one behind, and goes green -- the exact silent
+# drift the version-consistency check exists to catch after the fact.
+#
+# Three components, not two: release-please parses strict semver and throws
+# on "0.1", and npm rejects it outright. The historical v0.1 tag stands.
+# x-release-please-start-version
+__version__ = "0.1.0"
+# x-release-please-end
 
 HOME = Path.home()
 
@@ -569,10 +598,36 @@ def drift(st):
     return ("^%d" % ahead if ahead else "") + ("v%d" % behind if behind else "")
 
 
-def sort_key(st):
+# Sort cycles *within* a group, never across one. The group order is the whole
+# argument the tool makes -- cost of ignoring, not size or recency -- so a sort
+# that let ACTIVE float above MID-OPERATION would be answering a different
+# question than the one the table exists to answer.
+SORT_MODES = ("recent", "repo", "work")
+
+# Filters are subtractive views of the same table, not different tables.
+FILTER_MODES = ("all", "dirty", "stuck")
+FILTER_LABELS = {"all": "all", "dirty": "uncommitted", "stuck": "mid-operation"}
+
+
+def sort_key(st, mode="recent"):
     order, _ = bucket(st)
-    # Within a group, the tree touched most recently is the one being worked in.
+    if mode == "repo":
+        return (order, st["repo"], st["tree"], -(st["last_ts"] or 0))
+    if mode == "work":
+        # Most uncommitted work first: the biggest pile is the one most likely
+        # to be lost. Untracked counts, but only after tracked -- see work().
+        return (order, -st["tracked"], -st["untracked"], st["repo"], st["tree"])
+    # Default. Within a group, the tree touched most recently is the one being
+    # worked in.
     return (order, -(st["last_ts"] or 0), st["repo"], st["tree"])
+
+
+def passes_filter(st, filt):
+    if filt == "dirty":
+        return bool(st["tracked"] or st["untracked"])
+    if filt == "stuck":
+        return bool(st["operation"])
+    return True
 
 
 # -------------------------------------------------------------------- render
@@ -588,11 +643,18 @@ COLUMNS = (
 )
 
 
-def render(states, width=160, expand_quiet=False):
+def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"):
     if not states:
         return ["no git repositories found"]
 
-    rows = sorted(states, key=sort_key)
+    fleet = states
+    total = len(states)
+    if filt != "all":
+        states = [s for s in states if passes_filter(s, filt)]
+        if not states:
+            return ["no tree matches filter: %s" % FILTER_LABELS[filt]]
+
+    rows = sorted(states, key=lambda st: sort_key(st, sort_mode))
     shown = [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
     quiet = [s for s in rows if bucket(s)[1] == "QUIET" and not expand_quiet]
 
@@ -636,10 +698,22 @@ def render(states, width=160, expand_quiet=False):
         lines.append(c("QUIET (%d)  " % len(quiet) + names, DIM))
 
     lines.append("")
-    repos = len({s["common_dir"] for s in states})
-    dirty = sum(1 for s in states if s["tracked"])
-    stuck = sum(1 for s in states if s["operation"])
-    summary = "%d tree(s) across %d repo(s)" % (len(states), repos)
+    # Every count after the tree count describes the whole fleet, filtered or
+    # not. Recomputing them over the filtered subset makes "2 mid-operation"
+    # mean "2 of the ones you are currently looking at", which is the same
+    # misreading the "N of M" wording above exists to prevent -- and it is worse
+    # here, because the number stays plausible while quietly changing meaning.
+    repos = len({s["common_dir"] for s in fleet})
+    dirty = sum(1 for s in fleet if s["tracked"])
+    stuck = sum(1 for s in fleet if s["operation"])
+    if len(states) == total:
+        summary = "%d tree(s) across %d repo(s)" % (total, repos)
+    else:
+        # Say both numbers. A filtered count printed alone reads as the whole
+        # fleet, which is exactly the wrong impression for a tool whose job is
+        # telling you what you have not looked at.
+        summary = "%d of %d tree(s) across %d repo(s)  [filter: %s]" % (
+            len(states), total, repos, FILTER_LABELS[filt])
     if dirty:
         summary += "  |  %d with uncommitted work" % dirty
     if stuck:
@@ -734,6 +808,154 @@ def render_log(states, limit, width=160):
     return lines
 
 
+# ------------------------------------------------------------------- watch keys
+
+KEYMAP = (
+    ("?", "this map"),
+    ("r", "refresh now"),
+    ("s", "sort: recent / repo / work (within a group, never across)"),
+    ("f", "filter: all / uncommitted / mid-operation"),
+    ("a", "expand or collapse QUIET"),
+    ("q", "quit"),
+)
+
+
+class Keys:
+    """Single-key reads in watch mode, without curses.
+
+    curses is the obvious tool and the one leghorn and legbar reach for, but it
+    is not in the Windows stdlib and git-roost claims Windows support. It also
+    takes over the screen, which would mean two rendering paths for one table.
+    So this reads raw keys instead: cbreak plus select on POSIX, msvcrt on
+    Windows, and a plain sleep anywhere else -- a box with neither, or a stdout
+    that is a pipe rather than a terminal, degrades to exactly the timer-only
+    redraw that shipped in 0.1.
+
+    Deliberately not used by the one-shot render. That path touches no terminal
+    settings at all, which is what makes `git-roost | less` and `git-roost
+    --json | jq` safe.
+    """
+
+    def __init__(self, stream=None):
+        self.stream = stream if stream is not None else sys.stdin
+        self.enabled = False
+        self._fd = None
+        self._saved = None
+
+    def __enter__(self):
+        try:
+            if not self.stream.isatty():
+                return self
+        except (AttributeError, ValueError):
+            # A stdin that has been replaced or closed -- under a test harness,
+            # or `git-roost -w < /dev/null`. Not an error, just no keys.
+            return self
+        if msvcrt is not None:
+            self.enabled = True
+        elif termios is not None:
+            try:
+                self._fd = self.stream.fileno()
+                self._saved = termios.tcgetattr(self._fd)
+                # setcbreak, not setraw: it leaves ISIG alone, so Ctrl-C still
+                # raises KeyboardInterrupt and the existing exit path holds.
+                tty.setcbreak(self._fd)
+                self.enabled = True
+            except Exception:
+                self._saved = None
+        return self
+
+    def __exit__(self, *exc):
+        # Restoring matters more than it looks. cbreak leaves the terminal with
+        # no line discipline, so an exception path that skipped this would hand
+        # the user back a shell that does not echo what they type.
+        if self._saved is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+            except Exception:
+                pass
+        return False
+
+    def wait(self, timeout):
+        """Wait up to timeout seconds for a key. Returns the key, or None."""
+        if not self.enabled:
+            time.sleep(timeout)
+            return None
+        if msvcrt is not None:
+            deadline = time.time() + timeout
+            while True:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ("\x00", "\xe0"):
+                        # Function and arrow keys arrive as a prefix plus a
+                        # scan code. Swallow the second half, or an arrow key
+                        # reads as whatever letter shares its code -- Up is
+                        # 'H', which is nothing here today but would silently
+                        # become a hotkey the moment one is added.
+                        msvcrt.getwch()
+                        continue
+                    return ch
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                time.sleep(min(0.05, remaining))
+        r, _, _ = select.select([self._fd], [], [], timeout)
+        if not r:
+            return None
+        try:
+            return os.read(self._fd, 1).decode("utf-8", "replace")
+        except OSError:
+            return None
+
+
+def help_lines():
+    width = max(len(k) for k, _ in KEYMAP)
+    out = [c("KEYS", BOLD), ""]
+    out += ["  %s   %s" % (c(k.ljust(width), BOLD), desc) for k, desc in KEYMAP]
+    out += ["", c("any other key returns to the table", DIM)]
+    return out
+
+
+def apply_key(view, key):
+    """Fold one keypress into the live view. Returns "quit", "help" or None.
+
+    Split out of the watch loop so the keymap can be tested without a terminal.
+    Every other path in this file is testable headlessly and this one was not,
+    which is how a key ends up bound to nothing and nobody notices.
+    """
+    if key in ("q", "Q"):
+        return "quit"
+    if key == "?":
+        return "help"
+    if key in ("s", "S"):
+        view["sort"] = SORT_MODES[
+            (SORT_MODES.index(view["sort"]) + 1) % len(SORT_MODES)]
+    elif key in ("f", "F"):
+        view["filter"] = FILTER_MODES[
+            (FILTER_MODES.index(view["filter"]) + 1) % len(FILTER_MODES)]
+    elif key in ("a", "A"):
+        view["quiet"] = not view["quiet"]
+    # 'r' -- and any unbound key -- falls through to an immediate redraw, which
+    # is what refresh means here: the scan happens on the next line of the loop,
+    # not behind a cache.
+    return None
+
+
+def status_line(sort_mode, filt, expand_quiet, interval):
+    """The one line that says what view you are looking at.
+
+    Without it a filtered table is indistinguishable from a fleet that happens
+    to be quiet, which is the same failure the summary line guards against.
+    """
+    bits = [
+        time.strftime("git-roost  %H:%M:%S"),
+        "sort:%s" % sort_mode,
+        "filter:%s" % FILTER_LABELS[filt],
+        "quiet:%s" % ("shown" if expand_quiet else "collapsed"),
+        "%gs" % interval,
+    ]
+    return c("  ".join(bits), DIM) + c("   [?] keys", BOLD)
+
+
 # ------------------------------------------------------------------------ cli
 
 def scan(args):
@@ -741,13 +963,22 @@ def scan(args):
     return collect(discover(roots, args.depth))
 
 
-def body(args, width):
+def body(args, width, view=None):
+    """One frame. `view` is the live watch state; None means the flags alone.
+
+    The one-shot path passes None and renders exactly what 0.1 rendered. That is
+    the contract behind `git-roost | less` and `git-roost --json | jq`: keys move
+    the watch view and nothing else.
+    """
     states = scan(args)
     if args.json:
         return [json.dumps(states, indent=2, sort_keys=True)]
     if args.log is not None:
         return render_log(states, args.log, width)
-    return render(states, width, expand_quiet=args.all)
+    if view is None:
+        return render(states, width, expand_quiet=args.all)
+    return render(states, width, expand_quiet=view["quiet"],
+                  sort_mode=view["sort"], filt=view["filter"])
 
 
 def main(argv=None):
@@ -756,10 +987,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="git-roost",
         description="top for git -- every repo and worktree, most actionable first.",
+        epilog=("watch-mode keys:  " + "  ".join(
+            "%s %s" % (k, d.split(":")[0].split("(")[0].strip())
+            for k, d in KEYMAP)),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--version", action="version", version="git-roost %s" % __version__)
     ap.add_argument("-w", "--watch", nargs="?", const=3.0, type=float, metavar="SECS",
-                    help="redraw every SECS seconds (default 3)")
+                    help="redraw every SECS seconds (default 3); takes keys, see below")
     ap.add_argument("-1", "--once", action="store_true",
                     help="render once and exit (the default; overrides --watch)")
     ap.add_argument("--log", nargs="?", const=25, type=int, metavar="N",
@@ -792,19 +1027,40 @@ def main(argv=None):
         print("\n".join(body(args, width)))
         return 0
 
+    # Live view state, separate from args: the flags are the starting position
+    # and the keys move from there. --all seeds the quiet toggle, so `-a -w`
+    # opens expanded and `a` still collapses it.
+    view = {"sort": SORT_MODES[0], "filter": FILTER_MODES[0], "quiet": args.all}
+    helping = False
+
     try:
-        while True:
-            width = shutil.get_terminal_size((160, 24)).columns
-            out = body(args, width)
-            if ansi:
-                sys.stdout.write("\033[H\033[2J")
-            else:
-                # No VT support: a rule beats escape codes printed literally.
-                sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
-            sys.stdout.write(time.strftime("git-roost  %H:%M:%S") + "\n\n")
-            sys.stdout.write("\n".join(out) + "\n")
-            sys.stdout.flush()
-            time.sleep(args.watch)
+        with Keys() as keys:
+            while True:
+                width = shutil.get_terminal_size((160, 24)).columns
+                out = help_lines() if helping else body(args, width, view)
+                if ansi:
+                    sys.stdout.write("\033[H\033[2J")
+                else:
+                    # No VT support: a rule beats escape codes printed literally.
+                    sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
+                sys.stdout.write(status_line(
+                    view["sort"], view["filter"], view["quiet"], args.watch) + "\n\n")
+                sys.stdout.write("\n".join(out) + "\n")
+                sys.stdout.flush()
+
+                # The help overlay waits for a key rather than timing out under
+                # the reader. A keymap that vanished after 3s would be gone at
+                # exactly the moment someone was reading it.
+                key = keys.wait(3600 if helping and keys.enabled else args.watch)
+                if key is None:
+                    continue
+                if helping:
+                    helping = False
+                    continue
+                action = apply_key(view, key)
+                if action == "quit":
+                    break
+                helping = action == "help"
     except KeyboardInterrupt:
         pass
     return 0

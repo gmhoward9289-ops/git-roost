@@ -1,0 +1,75 @@
+name: release-please
+
+# The front half of releasing. release.yml is the back half: it fires on a `v*`
+# tag and does the actual publishing (GitHub Release, PyPI, npm, Homebrew tap).
+# Nothing here duplicates that work.
+#
+# What this replaces is the hand-cut release that produced v0.1 on 2026-08-02:
+# someone edited __version__, remembered (or did not) the man page header and
+# the formula, wrote a CHANGELOG entry, and pushed a tag. On every push to main
+# release-please instead maintains a single open "release PR" that bumps the
+# version in every artifact that carries it as literal text and prepends the
+# generated section to CHANGELOG.md. Merging that PR is the release decision;
+# release-please then pushes the tag, and release.yml takes it from there.
+#
+# This is why PR titles have to be conventional commits -- squash is the only
+# merge method here, and the squash subject is the PR title verbatim, which is
+# the only thing release-please reads to decide the bump and write the
+# changelog. pr-title-lint.yml is what keeps that true.
+#
+# Two facts about this repo that the config encodes and are easy to trip over:
+#
+#   * release-type is "node", not "python", and that is deliberate. The node
+#     strategy owns package.json, which is the one file here carrying a literal
+#     version that release-please knows how to bump natively. The python
+#     strategy would want a literal `version = "..."` in pyproject.toml -- and
+#     packaging/check-version-consistency.sh fails the build if one ever
+#     appears there, because [tool.hatch.version] reads git_roost.py and a
+#     second copy is a second thing to drift. Everything that is not
+#     package.json is handled through extra-files instead.
+#
+#   * .release-please-manifest.json seeds at 0.1.0, not 0.1, even though the
+#     shipped tag is v0.1. release-please parses versions as strict semver and
+#     throws "unable to parse version string" on a two-component version, so a
+#     manifest of "0.1" makes this workflow fail on its very first run rather
+#     than open a PR. 0.1.0 is the same release expressed in a form the tool
+#     can do arithmetic on; the historical v0.1 tag is untouched.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          # ONE-TIME SETUP: create a fine-grained PAT with Contents and Pull
+          # requests read/write on this repo and store it as the
+          # GIT_ROOST_RELEASE_PLEASE secret. It does not exist yet.
+          #
+          # This is not optional cosmetics. GitHub deliberately refuses to
+          # trigger workflows from events created with the default GITHUB_TOKEN,
+          # to stop workflows recursively triggering themselves. The tag
+          # release-please pushes is such an event, so with GITHUB_TOKEN the tag
+          # lands and release.yml simply never runs -- no error, no release,
+          # just silence, and the tap and PyPI stay on the previous version
+          # while GitHub shows a green tick.
+          #
+          # A PAT is a different actor, so the push event is real and
+          # release.yml fires.
+          #
+          # The fallback keeps this workflow functional before the secret
+          # exists: the release PR is still opened and maintained correctly, and
+          # only the publish step is missing. If a tag ever lands without a
+          # release, that is the symptom -- recover by running release.yml
+          # manually via workflow_dispatch, or by deleting and re-pushing the
+          # tag with a credential that is not GITHUB_TOKEN.
+          token: ${{ secrets.GIT_ROOST_RELEASE_PLEASE || secrets.GITHUB_TOKEN }}

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Puts the working copy on PATH for the tapes.
+#
+# vhs types the literal string `git-roost`, so without this it would record
+# whatever version happens to be installed on the recording machine -- which is
+# the one thing a demo of an unreleased change must not do.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+exec python3 "$here/git_roost.py" "$@"

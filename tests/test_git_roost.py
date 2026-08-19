@@ -481,6 +481,250 @@ class TestRender(unittest.TestCase):
             self.assertIn("2 tree(s) across 2 repo(s)", out)
 
 
+def renderable(**kw):
+    """A state complete enough for render(), which needs more than bucket() does."""
+    base = dict(state(), branch="main", detached=False, base="origin/main",
+                stashes=0, last_subject="s", conflicts=0, common_dir="/c/%s" % kw.get("repo", "r"),
+                path="/p/%s" % kw.get("tree", "t"))
+    base.update(kw)
+    base["common_dir"] = "/c/%s" % base["repo"]
+    return base
+
+
+class TestSortModes(unittest.TestCase):
+    """Sorting cycles within a group, never across one.
+
+    The group order is the argument the tool makes -- cost of ignoring, not
+    recency or size. A sort mode that let an ACTIVE tree float above a
+    MID-OPERATION one would quietly answer a different question, so every mode
+    is asserted to keep the bucket as its first key.
+    """
+
+    def test_every_mode_keeps_group_order_first(self):
+        rows = [
+            state(operation="rebase", repo="zulu", last_ts=1),
+            state(tracked=9, repo="alpha", last_ts=500),
+            state(last_ts=400, repo="mike"),
+        ]
+        for mode in git_roost.SORT_MODES:
+            ordered = sorted(rows, key=lambda st: git_roost.sort_key(st, mode))
+            self.assertEqual(
+                git_roost.bucket(ordered[0])[1], "MID-OPERATION",
+                "sort mode %r floated something above MID-OPERATION" % mode)
+
+    def test_recent_orders_by_last_commit_within_a_group(self):
+        older = state(tracked=1, repo="a", last_ts=100)
+        newer = state(tracked=1, repo="z", last_ts=900)
+        ordered = sorted([older, newer], key=lambda st: git_roost.sort_key(st, "recent"))
+        self.assertEqual([s["repo"] for s in ordered], ["z", "a"])
+
+    def test_repo_orders_alphabetically_within_a_group(self):
+        older = state(tracked=1, repo="a", last_ts=100)
+        newer = state(tracked=1, repo="z", last_ts=900)
+        ordered = sorted([older, newer], key=lambda st: git_roost.sort_key(st, "repo"))
+        self.assertEqual([s["repo"] for s in ordered], ["a", "z"])
+
+    def test_work_puts_the_biggest_pile_first(self):
+        small = state(tracked=1, repo="a", last_ts=900)
+        big = state(tracked=8, repo="z", last_ts=100)
+        ordered = sorted([small, big], key=lambda st: git_roost.sort_key(st, "work"))
+        self.assertEqual([s["repo"] for s in ordered], ["z", "a"])
+
+    def test_default_mode_matches_the_old_two_argument_behaviour(self):
+        # sort_key() gained a parameter; the default has to be what 0.1 did, or
+        # the one-shot table silently reorders for everyone who never pressed a
+        # key.
+        rows = [state(tracked=1, repo="a", last_ts=100),
+                state(tracked=1, repo="z", last_ts=900)]
+        self.assertEqual(
+            [git_roost.sort_key(s) for s in rows],
+            [git_roost.sort_key(s, "recent") for s in rows])
+
+
+class TestFilters(unittest.TestCase):
+    def test_dirty_counts_untracked_too(self):
+        # Untracked never gets its own bucket -- see work() -- but a filter
+        # asking "what have I not saved" that hid a tree with 12 untracked
+        # files would be answering the wrong question.
+        self.assertTrue(git_roost.passes_filter(state(untracked=3), "dirty"))
+        self.assertTrue(git_roost.passes_filter(state(tracked=1), "dirty"))
+        self.assertFalse(git_roost.passes_filter(state(), "dirty"))
+
+    def test_stuck_is_operations_only(self):
+        self.assertTrue(git_roost.passes_filter(state(operation="merge"), "stuck"))
+        self.assertFalse(git_roost.passes_filter(state(tracked=5), "stuck"))
+
+    def test_all_passes_everything(self):
+        for st in (state(), state(tracked=2), state(operation="rebase")):
+            self.assertTrue(git_roost.passes_filter(st, "all"))
+
+    def test_filtered_summary_reports_both_numbers(self):
+        # A filtered count printed alone reads as the whole fleet, which is the
+        # one impression this tool must never leave.
+        rows = [renderable(operation="rebase", repo="a", last_ts=1),
+                renderable(repo="b", last_ts=1), renderable(repo="c", last_ts=1)]
+        out = "\n".join(git_roost.render(rows, width=200, filt="stuck"))
+        self.assertIn("1 of 3 tree(s)", out)
+        self.assertIn("[filter: mid-operation]", out)
+
+    def test_filtered_summary_keeps_fleet_counts_fleet_wide(self):
+        # Only the tree count is filtered. Recomputing "N with uncommitted work"
+        # over the filtered subset leaves a number that is still plausible but
+        # now means "of the ones you are looking at" -- the same misreading the
+        # "N of M" wording exists to prevent.
+        rows = [renderable(operation="rebase", tracked=1, repo="a", last_ts=1),
+                renderable(tracked=4, repo="b", last_ts=1),
+                renderable(repo="c", last_ts=1)]
+        out = "%sn".replace("%s", chr(92)).join(
+            git_roost.render(rows, width=200, filt="stuck"))
+        self.assertIn("1 of 3 tree(s) across 3 repo(s)", out)
+        self.assertIn("2 with uncommitted work", out)
+
+    def test_filter_matching_nothing_says_so(self):
+        out = git_roost.render([renderable(repo="a", last_ts=1)], width=200, filt="stuck")
+        self.assertEqual(out, ["no tree matches filter: mid-operation"])
+
+    def test_unfiltered_summary_is_unchanged(self):
+        rows = [renderable(repo="a", last_ts=1), renderable(repo="b", last_ts=1)]
+        out = "\n".join(git_roost.render(rows, width=200, expand_quiet=True))
+        self.assertIn("2 tree(s) across 2 repo(s)", out)
+        self.assertNotIn("[filter:", out)
+
+
+class TestWatchKeys(unittest.TestCase):
+    """The keymap, and the promise that none of it reaches the one-shot path."""
+
+    def test_keymap_has_no_duplicate_bindings(self):
+        keys = [k for k, _ in git_roost.KEYMAP]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_every_documented_key_is_handled(self):
+        # The map is what the `?` overlay prints. A key documented but not wired
+        # would look like a broken feature rather than a missing one.
+        documented = {k for k, _ in git_roost.KEYMAP}
+        self.assertEqual(documented, {"?", "r", "s", "f", "a", "q"})
+
+    def test_help_overlay_lists_every_key(self):
+        out = "\n".join(git_roost.help_lines())
+        for key, _ in git_roost.KEYMAP:
+            self.assertIn(key, out)
+
+    def test_s_cycles_sort_and_wraps(self):
+        view = {"sort": git_roost.SORT_MODES[0], "filter": "all", "quiet": False}
+        seen = []
+        for _ in range(len(git_roost.SORT_MODES)):
+            git_roost.apply_key(view, "s")
+            seen.append(view["sort"])
+        # Every mode is reachable, and the cycle closes rather than dead-ending
+        # on the last one.
+        self.assertEqual(set(seen), set(git_roost.SORT_MODES))
+        self.assertEqual(view["sort"], git_roost.SORT_MODES[0])
+
+    def test_f_cycles_filter_and_wraps(self):
+        view = {"sort": "recent", "filter": git_roost.FILTER_MODES[0], "quiet": False}
+        for _ in range(len(git_roost.FILTER_MODES)):
+            git_roost.apply_key(view, "f")
+        self.assertEqual(view["filter"], git_roost.FILTER_MODES[0])
+
+    def test_a_toggles_quiet_both_ways(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False}
+        git_roost.apply_key(view, "a")
+        self.assertTrue(view["quiet"])
+        git_roost.apply_key(view, "a")
+        self.assertFalse(view["quiet"])
+
+    def test_q_quits_and_question_mark_opens_help(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False}
+        self.assertEqual(git_roost.apply_key(view, "q"), "quit")
+        self.assertEqual(git_roost.apply_key(view, "?"), "help")
+
+    def test_keys_are_case_insensitive(self):
+        lower = {"sort": "recent", "filter": "all", "quiet": False}
+        upper = {"sort": "recent", "filter": "all", "quiet": False}
+        for key in ("s", "f", "a"):
+            git_roost.apply_key(lower, key)
+            git_roost.apply_key(upper, key.upper())
+        self.assertEqual(lower, upper)
+        self.assertEqual(git_roost.apply_key(upper, "Q"), "quit")
+
+    def test_r_and_unbound_keys_change_nothing(self):
+        # 'r' is a redraw, which the loop does anyway on falling through. The
+        # test exists so a future edit cannot quietly give it a side effect.
+        for key in ("r", "R", "x", "5", " "):
+            view = {"sort": "repo", "filter": "dirty", "quiet": True}
+            self.assertIsNone(git_roost.apply_key(view, key))
+            self.assertEqual(view, {"sort": "repo", "filter": "dirty", "quiet": True})
+
+    def test_every_view_a_key_can_reach_renders(self):
+        # Cycling into a combination that crashes render() would only show up
+        # in someone's live watch loop, which is the worst place to find it.
+        rows = [renderable(operation="rebase", repo="a", last_ts=1),
+                renderable(tracked=2, repo="b", last_ts=1),
+                renderable(repo="c", last_ts=1)]
+        for sort_mode in git_roost.SORT_MODES:
+            for filt in git_roost.FILTER_MODES:
+                for quiet in (True, False):
+                    out = git_roost.render(rows, width=200, expand_quiet=quiet,
+                                           sort_mode=sort_mode, filt=filt)
+                    self.assertTrue(out and isinstance(out[0], str))
+
+    def test_reader_is_inert_when_stdin_is_not_a_tty(self):
+        # `git-roost -w < /dev/null`, or any test harness. It must degrade to
+        # the timer-only redraw rather than raising -- and it must never put a
+        # terminal it does not own into cbreak.
+        with git_roost.Keys(stream=io.StringIO()) as keys:
+            self.assertFalse(keys.enabled)
+            start = time.time()
+            self.assertIsNone(keys.wait(0.01))
+            self.assertGreaterEqual(time.time() - start, 0.005)
+
+    def test_reader_survives_a_closed_stream(self):
+        buf = io.StringIO()
+        buf.close()
+        with git_roost.Keys(stream=buf) as keys:
+            self.assertFalse(keys.enabled)
+
+    def test_status_line_names_the_active_view(self):
+        line = git_roost.status_line("repo", "dirty", False, 3.0)
+        self.assertIn("sort:repo", line)
+        self.assertIn("filter:uncommitted", line)
+        self.assertIn("quiet:collapsed", line)
+
+    def test_body_accepts_a_live_view(self):
+        # Regression: body() gained its `view` parameter in one edit and the
+        # watch loop started passing it in another. The suite stayed green
+        # because every test called the two-argument form, so the only thing
+        # that ever exercised the third argument was running the tool.
+        class Args:
+            json = False
+            log = None
+            all = False
+            root = None
+            depth = git_roost.DEFAULT_DEPTH
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = Args()
+            args.root = [tmp]
+            view = {"sort": "repo", "filter": "dirty", "quiet": True}
+            self.assertEqual(git_roost.body(args, 200, view),
+                             ["no git repositories found"])
+
+    def test_body_without_a_view_renders_the_one_shot_table(self):
+        # The contract behind `git-roost | less` and `git-roost --json | jq`:
+        # passing no view must produce exactly what the flags alone produce.
+        class Args:
+            json = False
+            log = None
+            all = False
+            root = None
+            depth = git_roost.DEFAULT_DEPTH
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = Args()
+            args.root = [tmp]
+            self.assertEqual(git_roost.body(args, 200), ["no git repositories found"])
+
+
 class TestCli(unittest.TestCase):
     def test_version_exits_clean(self):
         with self.assertRaises(SystemExit) as cm:
