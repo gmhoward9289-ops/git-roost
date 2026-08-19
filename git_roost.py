@@ -16,6 +16,7 @@ uncommitted work nobody has looked at, who is stuck mid-rebase.
     git-roost --log          # commit feed across every repo, newest first
     git-roost --all          # expand the QUIET group
     git-roost --json         # records, for piping somewhere else
+    git-roost --github       # add a PR/CI column, via `gh` (opt-in, network)
 
 Watch mode takes keys -- `?` for the map, `r` refresh, `s` sort, `f` filter, `a`
 quiet, `q` quit. The default one-shot render takes none and touches no terminal
@@ -30,6 +31,12 @@ refuses anything outside READ_ONLY -- so the tool cannot mutate a tree, an index
 or a ref even if a future edit tries to. The allowlist is keyed on the
 subcommand *and* its first argument, because `stash list` and `stash pop` are
 not the same kind of thing. tests/test_git_roost.py asserts that policy directly.
+
+`--github` is a second, separate opt-in: it shells out to `gh` for PR and CI
+state, which is a network call with its own latency and trust profile, so it
+never runs unless asked. Those calls go through gh_call(), a read-only wrapper
+in the same spirit as git() but keyed to gh's own danger surface -- see the
+"github (gh)" section below.
 """
 
 from __future__ import annotations
@@ -105,6 +112,18 @@ NESTED_WORKTREE_DIRS = (".worktrees", Path(".claude") / "worktrees")
 
 GIT_TIMEOUT = float(os.environ.get("GIT_ROOST_TIMEOUT") or 5)
 GIT_WORKERS = int(os.environ.get("GIT_ROOST_WORKERS") or 12)
+
+# gh hits the network, so it gets its own, longer timeout and its own, smaller
+# worker cap -- same GIT_ROOST_* naming convention as the two above. A slow or
+# rate-limited `gh` must never be allowed to starve the local git scan, which
+# is why this is a separate pool rather than sharing GIT_WORKERS.
+GH_TIMEOUT = float(os.environ.get("GIT_ROOST_GH_TIMEOUT") or 8)
+GH_WORKERS = int(os.environ.get("GIT_ROOST_GH_WORKERS") or 4)
+
+# Resolved once at import, not on every call: `gh` either exists on this box or
+# it doesn't, and --github degrades to a blank column / null JSON keys when it
+# is missing rather than erroring partway through a scan.
+GH_PATH = shutil.which("gh")
 
 # A commit this recent means someone is working in the tree right now.
 ACTIVE_SECS = 3600
@@ -649,7 +668,8 @@ COLUMNS = (
 )
 
 
-def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"):
+def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all",
+           github=False):
     if not states:
         return ["no git repositories found"]
 
@@ -664,11 +684,16 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
     shown = [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
     quiet = [s for s in rows if bucket(s)[1] == "QUIET" and not expand_quiet]
 
-    cells = [[fn(s) for _, fn in COLUMNS] for s in shown]
-    headers = [h for h, _ in COLUMNS]
+    # The PR/CI column is opt-in: appended rather than baked into COLUMNS, so
+    # the default table is byte-for-byte what it always was for anyone who
+    # never passes --github.
+    columns = COLUMNS + (GITHUB_COLUMN,) if github else COLUMNS
+
+    cells = [[fn(s) for _, fn in columns] for s in shown]
+    headers = [h for h, _ in columns]
     widths = [
         max([len(headers[i])] + [row[i] and len(row[i]) or 0 for row in cells] or [0])
-        for i in range(len(COLUMNS))
+        for i in range(len(columns))
     ]
 
     used = sum(widths) + 2 * len(widths) + 2
@@ -676,7 +701,7 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
 
     lines = []
     lines.append(c("  " + "  ".join(
-        headers[i].ljust(widths[i]) for i in range(len(COLUMNS))
+        headers[i].ljust(widths[i]) for i in range(len(columns))
     ) + "  " + "SUBJECT", BOLD))
 
     current = None
@@ -695,7 +720,7 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
             subject += " **"
         if len(subject) > subject_w:
             subject = subject[: subject_w - 3] + "..."
-        body = "  ".join(row[i].ljust(widths[i]) for i in range(len(COLUMNS)))
+        body = "  ".join(row[i].ljust(widths[i]) for i in range(len(columns)))
         lines.append("  " + body + "  " + subject)
 
     if quiet:
@@ -812,6 +837,204 @@ def render_log(states, limit, width=160):
     lines.append("")
     lines.append("%d commit(s) across %d repo(s)" % (len(merged), len({r["repo"] for r in merged})))
     return lines
+
+
+# ---------------------------------------------------------------- github (gh)
+
+# What this tool is allowed to run through `gh`: command -> (permitted
+# subcommands, most positional arguments a read-only form can take).
+#
+# gh does not have git's flag-laundering problem -- `symbolic-ref --short HEAD
+# X` rewrites HEAD despite opening with a read flag, but no flag turns
+# `gh pr view` into a write. Every gh operation that mutates a PR (merge,
+# close, edit, ready, review, comment) is a separate subcommand, not a flag on
+# list/view/status. So the allowlist only needs (command, subcommand); the
+# positional cap is still here as the same fail-closed backstop check_read_only
+# uses -- a future call site that starts interpolating a bare argument where a
+# flag value belongs gets refused rather than silently let through.
+GH_READ_ONLY = {
+    "pr": (frozenset(("view", "list", "status")), 0),
+}
+
+
+def check_gh_read_only(args):
+    """Raise unless args is a form of `gh` that cannot modify anything.
+
+    Split out from gh_call() for the same reason check_read_only() is split
+    from git(): so the test suite can assert the policy directly, and because
+    the guarantee that this tool cannot write matters more than any one call
+    site remembering to respect it.
+    """
+    if not args:
+        raise NotReadOnly("git-roost refuses an empty gh invocation")
+    cmd = args[0]
+    if cmd not in GH_READ_ONLY:
+        raise NotReadOnly("git-roost refuses non-read-only gh command: %r" % cmd)
+    allowed, max_positional = GH_READ_ONLY[cmd]
+    sub = args[1] if len(args) > 1 else ""
+    if sub not in allowed:
+        raise NotReadOnly(
+            "git-roost refuses %r: only %s are read-only"
+            % (" ".join(args[:2]), ", ".join(sorted(allowed)))
+        )
+    # Flag values must use --flag=value form (as every call site here does),
+    # exactly like git()'s "--porcelain=v2": a space-separated value would
+    # look positional and could push this over the cap for a legitimate call.
+    positional = [a for a in args[2:] if not a.startswith("-")]
+    if len(positional) > max_positional:
+        raise NotReadOnly(
+            "git-roost refuses %r: %d positional argument(s), read-only gh %s "
+            "%s takes at most %d"
+            % (" ".join(args), len(positional), cmd, sub, max_positional)
+        )
+
+
+def gh_call(dirpath, *args):
+    """One read-only `gh` call, cwd-scoped to a tree. None on any failure.
+
+    Same best-effort contract as git(): no `gh` on PATH, no auth, no GitHub
+    remote for this tree, a rate limit, or a slow network are all just "we
+    don't know" for this one tree, never a reason to fail the whole scan. gh
+    has no -C equivalent, so the working directory does the scoping git() gets
+    from -C -- this is why every caller passes a path, same shape as git().
+    """
+    check_gh_read_only(args)
+    if GH_PATH is None:
+        return None
+    try:
+        out = subprocess.run(
+            (GH_PATH,) + tuple(args),
+            cwd=str(dirpath),
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout
+
+
+# The five facts kept per tree. Present in a JSON record only when --github was
+# passed -- see apply_github_facts() -- which keeps the default `--json`
+# contract untouched for every consumer that never asks for GitHub data.
+GITHUB_KEYS = ("pr_number", "pr_state", "pr_draft", "pr_review", "pr_ci")
+
+
+def github_facts(path):
+    """PR + CI facts for one tree's current branch, or None.
+
+    One `gh pr view` call gets everything this tool wants: the PR number,
+    whether it is draft, the review decision, and the full check-run rollup
+    for HEAD, all in one round trip -- run from inside the tree so gh resolves
+    "the PR for this branch" itself, the same way git() relies on -C to scope
+    a call instead of asking the caller to already know the answer.
+
+    None whenever there is no open PR for the branch, no GitHub remote, `gh`
+    is missing or unauthenticated, or the call fails for any other reason --
+    it renders as a blank column, not an error.
+    """
+    out = gh_call(
+        path, "pr", "view",
+        "--json=number,state,isDraft,reviewDecision,statusCheckRollup",
+    )
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+
+    # statusCheckRollup mixes GitHub Actions check-runs (status/conclusion)
+    # with external commit statuses (state instead) -- both need reading, or
+    # a repo whose CI is a status API integration would always show blank.
+    # Any run still in progress makes the whole PR "pending"; any failure
+    # makes it "failure" even if something else already succeeded; otherwise
+    # a rollup that reported anything at all is "success".
+    ci = None
+    checks = data.get("statusCheckRollup") or []
+    if checks:
+        failed = pending = seen = False
+        for chk in checks:
+            status = (chk.get("status") or "").upper()
+            conclusion = (chk.get("conclusion") or chk.get("state") or "").upper()
+            if status and status != "COMPLETED":
+                pending = True
+                continue
+            seen = True
+            if conclusion in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR"):
+                failed = True
+        if failed:
+            ci = "failure"
+        elif pending:
+            ci = "pending"
+        elif seen:
+            ci = "success"
+
+    return {
+        "pr_number": data.get("number"),
+        "pr_state": (data.get("state") or "").lower() or None,
+        "pr_draft": bool(data.get("isDraft")),
+        "pr_review": data.get("reviewDecision") or None,
+        "pr_ci": ci,
+    }
+
+
+def github_facts_map(states):
+    """{tree path: facts} for every tree, fetched fresh, fanned out like collect().
+
+    Its own ThreadPoolExecutor and its own GH_WORKERS cap -- sharing the git
+    pool would let a slow `gh` call hold a worker a local git scan needed, the
+    exact starvation this tool exists to avoid inflicting on itself.
+    """
+    if not states or GH_PATH is None:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(GH_WORKERS, len(states))) as pool:
+        facts = list(pool.map(lambda s: github_facts(Path(s["path"])), states))
+    return {s["path"]: (f or {}) for s, f in zip(states, facts)}
+
+
+def apply_github_facts(states, facts_map):
+    """Merge PR/CI facts onto states in place, defaulting absent ones to None.
+
+    Always sets all five keys once called, even for a tree facts_map has
+    nothing for (no PR, gh missing, the call failed) -- that is what makes the
+    keys a stable, always-present-when-enabled shape rather than sometimes
+    there and sometimes not depending on what gh happened to return.
+    """
+    for st in states:
+        gh = facts_map.get(st["path"]) or {}
+        st["pr_number"] = gh.get("pr_number")
+        st["pr_state"] = gh.get("pr_state")
+        st["pr_draft"] = gh.get("pr_draft", False)
+        st["pr_review"] = gh.get("pr_review")
+        st["pr_ci"] = gh.get("pr_ci")
+    return states
+
+
+def github_cell(s):
+    """PR column: '#123', '#123+' success, '#123x' failure, '#123~' pending,
+    '#123 draft', or blank when there is no open PR.
+
+    ASCII on purpose, not the checkmark/cross this might otherwise reach for --
+    ascii_safe() exists a few hundred lines up because the Windows console
+    codepage mangles exactly that kind of glyph mid-table, and this column
+    should not need its own escape hatch from the same problem.
+    """
+    n = s.get("pr_number")
+    if not n:
+        return ""
+    if s.get("pr_draft"):
+        return "#%d draft" % n
+    mark = {"success": "+", "failure": "x", "pending": "~"}.get(s.get("pr_ci"), "")
+    return "#%d%s" % (n, mark)
+
+
+# Appended to COLUMNS only when --github is passed -- see render()'s `github`
+# parameter. Kept separate from COLUMNS itself so the default table layout is
+# untouched for the far more common case of nobody asking for network calls.
+GITHUB_COLUMN = ("PR", github_cell)
 
 
 # ------------------------------------------------------------------- watch keys
@@ -969,7 +1192,7 @@ def scan(args):
     return collect(discover(roots, args.depth))
 
 
-def body(args, width, view=None):
+def body(args, width, view=None, github_map=None):
     """One frame plus the states it was built from. `view` is the live watch
     state; None means the flags alone.
 
@@ -979,17 +1202,29 @@ def body(args, width, view=None):
     behind `git-roost | less` and `git-roost --json | jq`: keys move the watch
     view and nothing else. States come back alongside the lines so --fail-on
     can inspect the fleet without a second scan.
+
+    `github_map` is the watch loop's cache hook: pass a pre-fetched {path:
+    facts} map to skip a fresh `gh` round trip this frame, or leave it None to
+    fetch fresh (which is exactly right for the one-shot path -- it only ever
+    calls this once, so there is no cache to reuse). getattr() guards
+    args.github because the inline Args stubs a couple of tests use predate
+    this flag and do not set it.
     """
     states = scan(args)
+    if getattr(args, "github", False):
+        if github_map is None:
+            github_map = github_facts_map(states)
+        apply_github_facts(states, github_map)
+    show_github = getattr(args, "github", False)
     if args.json:
         return [json.dumps(states, indent=2, sort_keys=True)], states
     if args.log is not None:
         return render_log(states, args.log, width), states
     if view is None:
-        return render(states, width, expand_quiet=args.all,
-                      sort_mode=args.sort, filt=args.filter), states
-    return render(states, width, expand_quiet=view["quiet"],
-                  sort_mode=view["sort"], filt=view["filter"]), states
+        return render(states, width, expand_quiet=args.all, sort_mode=args.sort,
+                      filt=args.filter, github=show_github), states
+    return render(states, width, expand_quiet=view["quiet"], sort_mode=view["sort"],
+                  filt=view["filter"], github=show_github), states
 
 
 def exit_code(states, fail_on):
@@ -1048,6 +1283,14 @@ def main(argv=None):
                          "the whole fleet, not --filter. Default none (always 0).")
     ap.add_argument("--json", action="store_true", help="emit records as JSON")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
+    ap.add_argument("--github", action="store_true",
+                    help="add a PR/CI column via `gh` (opt-in: network calls, "
+                         "needs gh on PATH and authenticated; silently omitted "
+                         "otherwise)")
+    ap.add_argument("--github-interval", type=float, default=30.0, metavar="SECS",
+                    help="in watch mode, refresh PR/CI data at most every SECS "
+                         "seconds rather than every redraw (default 30); no "
+                         "effect outside -w or without --github")
     args = ap.parse_args(argv)
 
     # Escape sequences need a real terminal that understands them. This gates
@@ -1078,6 +1321,15 @@ def main(argv=None):
     helping = False
     last_states = []
 
+    # GitHub data is cached across redraws and refreshed on its own, longer
+    # interval (--github-interval, default 30s) rather than every redraw
+    # (default 3s). The local git scan is fast and local; `gh` is neither --
+    # it is a network call subject to GitHub's own rate limits, so re-fetching
+    # it every frame would be both slow and a good way to get throttled for no
+    # benefit, since a PR's review state rarely changes inside a 3s window.
+    github_map = {}
+    last_gh_fetch = 0.0
+
     try:
         with Keys() as keys:
             while True:
@@ -1085,7 +1337,21 @@ def main(argv=None):
                 if helping:
                     out = help_lines()
                 else:
-                    out, last_states = body(args, width, view)
+                    now = time.time()
+                    due = (args.github and
+                           (now - last_gh_fetch >= args.github_interval or not github_map))
+                    out, last_states = body(
+                        args, width, view, github_map=None if due else github_map)
+                    if due:
+                        # body() just fetched fresh facts and folded them into
+                        # last_states; pull them back out into the cache so the
+                        # next few frames can reuse them without asking `gh`
+                        # again.
+                        github_map = {
+                            s["path"]: {k: s.get(k) for k in GITHUB_KEYS}
+                            for s in last_states
+                        }
+                        last_gh_fetch = now
                 if ansi:
                     sys.stdout.write("\033[H\033[2J")
                 else:

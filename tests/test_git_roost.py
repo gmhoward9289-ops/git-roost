@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
@@ -703,6 +704,7 @@ class TestWatchKeys(unittest.TestCase):
             depth = git_roost.DEFAULT_DEPTH
             sort = git_roost.SORT_MODES[0]
             filter = git_roost.FILTER_MODES[0]
+            github = False
 
         with tempfile.TemporaryDirectory() as tmp:
             args = Args()
@@ -723,6 +725,7 @@ class TestWatchKeys(unittest.TestCase):
             depth = git_roost.DEFAULT_DEPTH
             sort = git_roost.SORT_MODES[0]
             filter = git_roost.FILTER_MODES[0]
+            github = False
 
         with tempfile.TemporaryDirectory() as tmp:
             args = Args()
@@ -827,6 +830,281 @@ class TestExitCode(unittest.TestCase):
         # caller also passed --filter for a human to read at the same time.
         fleet = [self._state(), self._state(operation="rebase")]
         self.assertEqual(git_roost.exit_code(fleet, "stuck"), 1)
+
+
+HAVE_GH = bool(__import__("shutil").which("gh"))
+needs_gh = unittest.skipUnless(HAVE_GH, "gh is not installed")
+
+
+class TestGhReadOnlyGuard(unittest.TestCase):
+    """gh's own read-only wrapper. Same spirit as TestReadOnlyGuard, adapted to
+    gh's shape: writes live on separate subcommands rather than behind flags on
+    a read one, so the allowlist only needs (command, subcommand) plus the same
+    fail-closed positional cap check_read_only uses.
+    """
+
+    def test_write_subcommands_raise(self):
+        for args in [
+            ("pr", "merge"), ("pr", "close"), ("pr", "edit"),
+            ("pr", "ready"), ("pr", "review"), ("pr", "comment"),
+            ("pr", "create"), ("pr", "reopen"),
+        ]:
+            with self.assertRaises(git_roost.NotReadOnly, msg=" ".join(args)):
+                git_roost.check_gh_read_only(args)
+
+    def test_non_pr_commands_raise(self):
+        for args in [("issue", "list"), ("repo", "delete"), ("api", "graphql"),
+                     ("run", "rerun"), ("workflow", "run")]:
+            with self.assertRaises(git_roost.NotReadOnly, msg=" ".join(args)):
+                git_roost.check_gh_read_only(args)
+
+    def test_empty_args_raise(self):
+        with self.assertRaises(git_roost.NotReadOnly):
+            git_roost.check_gh_read_only(())
+
+    def test_safe_forms_are_permitted(self):
+        for args in [
+            ("pr", "view", "--json=number,state"),
+            ("pr", "list", "--json=number"),
+            ("pr", "status"),
+            ("pr", "view"),
+        ]:
+            git_roost.check_gh_read_only(args)  # must not raise
+
+    def test_a_bare_positional_argument_is_refused(self):
+        # The positional cap is a fail-closed backstop, same shape as git's:
+        # a value that should have arrived as --flag=value instead looks like
+        # an unexamined extra argument, and this refuses it rather than
+        # guessing it is still safe.
+        with self.assertRaises(git_roost.NotReadOnly):
+            git_roost.check_gh_read_only(("pr", "view", "some-branch"))
+
+    def test_gh_call_checks_before_touching_the_subprocess(self):
+        # A refused call must never reach subprocess.run, whether or not gh is
+        # even installed on this machine.
+        with self.assertRaises(git_roost.NotReadOnly):
+            git_roost.gh_call("/tmp", "pr", "merge")
+
+
+class FakeCompleted:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+class TestGhCall(unittest.TestCase):
+    """gh_call()'s best-effort contract: never raise, never block the scan."""
+
+    def test_returns_none_when_gh_is_not_on_path(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", None):
+            self.assertIsNone(git_roost.gh_call("/tmp", "pr", "view"))
+
+    def test_returns_none_on_timeout(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost.subprocess, "run",
+                 side_effect=git_roost.subprocess.TimeoutExpired("gh", 8)):
+            self.assertIsNone(git_roost.gh_call("/tmp", "pr", "view"))
+
+    def test_returns_none_on_oserror(self):
+        # gh vanishing between shutil.which() and the call, or a bad cwd.
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost.subprocess, "run", side_effect=OSError("boom")):
+            self.assertIsNone(git_roost.gh_call("/tmp", "pr", "view"))
+
+    def test_returns_none_on_nonzero_exit(self):
+        # No PR for this branch, no GitHub remote, not authenticated -- gh
+        # reports all of these as a plain nonzero exit, not an exception.
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost.subprocess, "run",
+                 return_value=FakeCompleted(returncode=1)):
+            self.assertIsNone(git_roost.gh_call("/tmp", "pr", "view"))
+
+    def test_returns_stdout_on_success(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost.subprocess, "run",
+                 return_value=FakeCompleted(stdout='{"number": 1}')):
+            self.assertEqual(git_roost.gh_call("/tmp", "pr", "view"), '{"number": 1}')
+
+    @needs_gh
+    def test_gh_call_against_a_non_repo_directory_degrades_to_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(git_roost.gh_call(tmp, "pr", "view", "--json=number"))
+
+
+PR_JSON = (
+    '{"number": 42, "state": "OPEN", "isDraft": false, '
+    '"reviewDecision": "APPROVED", "statusCheckRollup": %s}'
+)
+
+
+class TestGithubFacts(unittest.TestCase):
+    """Parsing/rollup logic against canned `gh pr view --json` output, so this
+    does not need a real `gh` or network access to run.
+    """
+
+    def _facts(self, checks_json, gh_stdout=None):
+        stdout = gh_stdout if gh_stdout is not None else PR_JSON % checks_json
+        with unittest.mock.patch.object(git_roost, "gh_call", return_value=stdout):
+            return git_roost.github_facts("/tmp")
+
+    def test_no_pr_is_none(self):
+        with unittest.mock.patch.object(git_roost, "gh_call", return_value=None):
+            self.assertIsNone(git_roost.github_facts("/tmp"))
+
+    def test_invalid_json_is_none(self):
+        with unittest.mock.patch.object(git_roost, "gh_call", return_value="not json"):
+            self.assertIsNone(git_roost.github_facts("/tmp"))
+
+    def test_basic_fields(self):
+        facts = self._facts("[]")
+        self.assertEqual(facts["pr_number"], 42)
+        self.assertEqual(facts["pr_state"], "open")
+        self.assertFalse(facts["pr_draft"])
+        self.assertEqual(facts["pr_review"], "APPROVED")
+        self.assertIsNone(facts["pr_ci"])  # no checks reported at all
+
+    def test_draft_flag(self):
+        stdout = ('{"number": 1, "state": "OPEN", "isDraft": true, '
+                  '"reviewDecision": null, "statusCheckRollup": []}')
+        facts = self._facts(None, gh_stdout=stdout)
+        self.assertTrue(facts["pr_draft"])
+        self.assertIsNone(facts["pr_review"])
+
+    def test_all_checks_succeeded_is_success(self):
+        checks = ('[{"status": "COMPLETED", "conclusion": "SUCCESS"}, '
+                  '{"status": "COMPLETED", "conclusion": "SUCCESS"}]')
+        self.assertEqual(self._facts(checks)["pr_ci"], "success")
+
+    def test_any_failure_wins_over_a_success(self):
+        checks = ('[{"status": "COMPLETED", "conclusion": "SUCCESS"}, '
+                  '{"status": "COMPLETED", "conclusion": "FAILURE"}]')
+        self.assertEqual(self._facts(checks)["pr_ci"], "failure")
+
+    def test_in_progress_check_is_pending(self):
+        checks = '[{"status": "IN_PROGRESS", "conclusion": null}]'
+        self.assertEqual(self._facts(checks)["pr_ci"], "pending")
+
+    def test_pending_does_not_hide_a_failure(self):
+        # A run still queued must not mask a check that already failed.
+        checks = ('[{"status": "IN_PROGRESS", "conclusion": null}, '
+                  '{"status": "COMPLETED", "conclusion": "FAILURE"}]')
+        self.assertEqual(self._facts(checks)["pr_ci"], "failure")
+
+    def test_external_status_context_uses_state_not_conclusion(self):
+        # Commit statuses (as opposed to check-runs) carry "state", not
+        # "status"/"conclusion" -- both shapes appear in the same rollup.
+        checks = '[{"state": "FAILURE"}]'
+        self.assertEqual(self._facts(checks)["pr_ci"], "failure")
+
+
+class TestGithubColumn(unittest.TestCase):
+    def test_no_pr_is_blank(self):
+        self.assertEqual(git_roost.github_cell({"pr_number": None}), "")
+
+    def test_draft(self):
+        cell = git_roost.github_cell({"pr_number": 7, "pr_draft": True})
+        self.assertEqual(cell, "#7 draft")
+
+    def test_success_marker(self):
+        cell = git_roost.github_cell(
+            {"pr_number": 7, "pr_draft": False, "pr_ci": "success"})
+        self.assertEqual(cell, "#7+")
+
+    def test_failure_marker(self):
+        cell = git_roost.github_cell(
+            {"pr_number": 7, "pr_draft": False, "pr_ci": "failure"})
+        self.assertEqual(cell, "#7x")
+
+    def test_pending_marker(self):
+        cell = git_roost.github_cell(
+            {"pr_number": 7, "pr_draft": False, "pr_ci": "pending"})
+        self.assertEqual(cell, "#7~")
+
+    def test_no_ci_data_is_just_the_number(self):
+        cell = git_roost.github_cell(
+            {"pr_number": 7, "pr_draft": False, "pr_ci": None})
+        self.assertEqual(cell, "#7")
+
+    def test_cell_text_is_pure_ascii(self):
+        # See github_cell()'s docstring: this column deliberately avoids the
+        # console-mangling problem ascii_safe() exists for elsewhere.
+        for cell in ("#7 draft", "#7+", "#7x", "#7~", "#7"):
+            self.assertTrue(all(32 <= ord(ch) < 127 for ch in cell))
+
+
+class TestGithubFlagGating(unittest.TestCase):
+    """--github must be opt-in: the column and the JSON keys only appear when
+    it is actually passed, and the tool must not need a real `gh` to prove it.
+    """
+
+    def test_column_absent_by_default(self):
+        rows = [renderable(repo="a", last_ts=1)]
+        out = "\n".join(git_roost.render(rows, width=200, expand_quiet=True))
+        self.assertNotIn("PR", out.split("\n")[0].split())
+
+    def test_column_present_when_requested(self):
+        rows = [renderable(repo="a", last_ts=1, pr_number=None, pr_draft=False,
+                           pr_ci=None)]
+        out = "\n".join(git_roost.render(rows, width=200, expand_quiet=True, github=True))
+        self.assertIn("PR", out.split("\n")[0].split())
+
+    def test_json_keys_absent_without_github_flag(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", None), \
+             tempfile.TemporaryDirectory() as tmp:
+            if HAVE_GIT:
+                make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json"])
+            data = json.loads(buf.getvalue())
+            if data:
+                for key in git_roost.GITHUB_KEYS:
+                    self.assertNotIn(key, data[0])
+
+    @needs_git
+    def test_json_keys_present_and_null_when_gh_is_missing(self):
+        # --github still adds the keys even when gh itself is not on the box --
+        # present-but-null, not present-only-when-gh-succeeds, is what keeps
+        # this a stable shape for a consumer to depend on.
+        with unittest.mock.patch.object(git_roost, "GH_PATH", None), \
+             tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json", "--github"])
+            data = json.loads(buf.getvalue())
+            for key in git_roost.GITHUB_KEYS:
+                self.assertIn(key, data[0])
+            self.assertIsNone(data[0]["pr_number"])
+
+    @needs_git
+    def test_json_keys_reflect_a_fetched_pr(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost, "gh_call", return_value=PR_JSON % "[]"), \
+             tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json", "--github"])
+            data = json.loads(buf.getvalue())
+            self.assertEqual(data[0]["pr_number"], 42)
+            self.assertEqual(data[0]["pr_review"], "APPROVED")
+
+    def test_apply_github_facts_defaults_are_stable(self):
+        states = [{"path": "/p/a"}, {"path": "/p/b"}]
+        git_roost.apply_github_facts(states, {"/p/a": {"pr_number": 5}})
+        self.assertEqual(states[0]["pr_number"], 5)
+        self.assertIsNone(states[1]["pr_number"])
+        self.assertFalse(states[1]["pr_draft"])
+
+    def test_github_facts_map_is_empty_without_gh(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", None):
+            self.assertEqual(git_roost.github_facts_map([{"path": "/p/a"}]), {})
 
 
 class TestRootEnvVar(unittest.TestCase):
