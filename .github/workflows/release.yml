@@ -13,7 +13,9 @@ name: release
 #   Homebrew  -- packaging/git-roost.rb copied into gmhoward9289-ops/homebrew-tap
 #                with a checksum computed from the sdist this run just uploaded.
 #   winget    -- a PR against microsoft/winget-pkgs, opened by wingetcreate
-#                against the Windows portable zip this run built.
+#                against the Windows portable zip the windows-zip job built
+#                (git-roost.exe, compiled from packaging/git-roost-launcher.cs,
+#                plus git_roost.py).
 #
 # The .deb is built and attached to the release, so `sudo apt install
 # ./git-roost_<version>_all.deb` works. It is deliberately NOT pushed into a
@@ -43,21 +45,6 @@ jobs:
 
       - name: Build the .deb
         run: packaging/build-deb.sh
-
-      # winget has nothing like npm's postinstall or brew's `depends_on`: a
-      # "zip"/"portable" winget package is just files dropped on disk and
-      # symlinked onto PATH. So the installer it needs is this zip -- the
-      # batch sibling of bin/git-roost.js plus the script itself -- built here
-      # rather than shipped as a separate repo artifact, so it can never drift
-      # from the git_roost.py this run just built everything else from.
-      #
-      # Lives in dist/ alongside the wheel, sdist and .deb so the existing
-      # "Attach to the release" step below picks it up with no extra step, and
-      # the existing download-artifact steps in pypi/homebrew-tap need no
-      # changes -- only the pypi job additionally filters it back out, the same
-      # way it already does for the .deb.
-      - name: Build the Windows portable zip
-        run: packaging/build-windows-zip.sh
 
       # __version__ in git_roost.py is the single source the whole toolchain
       # reads (hatch, build-deb.sh, the CLI). A tag that disagrees with it would
@@ -196,11 +183,11 @@ jobs:
         with:
           name: dist
           path: dist
-      # The build job's artifact carries the .deb and the Windows zip as well,
-      # and gh-action-pypi-publish uploads the whole directory -- an unfiltered
+      # The build job's artifact carries the .deb as well, and
+      # gh-action-pypi-publish uploads the whole directory -- an unfiltered
       # dist/ fails the run on a file PyPI was never going to accept.
-      - name: Drop the .deb and the Windows zip -- PyPI takes wheels and sdists only
-        run: rm -f dist/*.deb dist/*.zip
+      - name: Drop the .deb -- PyPI takes wheels and sdists only
+        run: rm -f dist/*.deb
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
   # Publishes to npm as `git-roost` via trusted publishing (OIDC), the same
@@ -363,6 +350,42 @@ jobs:
           git diff --cached --quiet && echo "nothing changed" || git commit -m "git-roost $GITHUB_REF_NAME"
           git push origin master
 
+  # Builds the Windows portable zip winget installs. Its own job, on
+  # windows-latest, rather than a step in `build`: the zip has to carry a real
+  # PE executable, not a script, because winget's "portable" nested installer
+  # type requires one -- wingetcreate rejected an earlier version of this that
+  # shipped a batch wrapper outright ("No supported installer(s) found in zip
+  # archive"), however faithfully the batch file reproduced the interpreter
+  # probe. Producing a real .exe needs a C# compiler, and `build`'s
+  # ubuntu-latest runner has none; packaging/build-windows-zip.ps1 gets one for
+  # free from Windows PowerShell's Add-Type reaching into .NET Framework, which
+  # only exists on Windows.
+  #
+  # needs: build, not the other way around, because this uploads straight to
+  # the release build creates -- `gh release upload` rather than the
+  # upload-artifact/download-artifact pair the other jobs use, since nothing
+  # downstream needs this file locally the way pypi needs the wheel.
+  windows-zip:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # MUST be Windows PowerShell (powershell.exe), not PowerShell 7/Core
+      # (pwsh, the default `shell:` on windows-latest runners) -- see the
+      # script's own header comment for why Add-Type's ConsoleApplication
+      # output only works under the former.
+      - name: Build the Windows portable zip
+        shell: powershell
+        run: packaging/build-windows-zip.ps1
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/*-windows.zip --clobber --repo ${{ github.repository }}
+
   # Publishes to winget by opening a PR against microsoft/winget-pkgs -- a
   # repo this project does not own, cannot push to directly, and whose review
   # process is Microsoft's, not this workflow's. The action wraps wingetcreate,
@@ -394,7 +417,7 @@ jobs:
   # same degrade-alone shape as every other channel above.
   winget:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: windows-zip
     runs-on: windows-latest
     steps:
       # windows-latest, not ubuntu-latest like every sibling job: wingetcreate

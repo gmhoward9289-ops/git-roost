@@ -4,10 +4,3 @@
 # and run under WSL.
 * text=auto eol=lf
 *.py text eol=lf
-
-# The inverse of the rule above: packaging/git-roost.cmd never runs anywhere
-# but cmd.exe, which is the one interpreter here that actually expects CRLF --
-# unlike LF-only shebang scripts, an LF-only batch file mostly works by luck of
-# cmd.exe's tolerance rather than by contract. Pin it explicitly rather than
-# rely on that tolerance.
-*.cmd text eol=crlf
