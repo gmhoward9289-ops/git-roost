@@ -89,6 +89,8 @@ git-roost --log          # commit feed across every repo, newest first
 git-roost --all          # expand the QUIET group
 git-roost --json         # records, for piping somewhere else
 git-roost --root ~/src   # look somewhere other than ~/GitHub (repeatable)
+git-roost --repo wings --filter dirty   # scope to one repo, one view
+git-roost --check        # no table -- exit 1 if any tree needs a human first
 ```
 
 Watch mode takes keys:
@@ -106,6 +108,26 @@ Sort cycles *within* a group and never across one. The group order is the whole
 argument this tool makes — cost of ignoring, not recency or size — so a sort
 that let an `ACTIVE` tree float above a `MID-OPERATION` one would be quietly
 answering a different question.
+
+`--repo NAME` (repeatable, case-insensitive substring) and `--filter
+{all,dirty,stuck}` put the `f` key's view on the command line, so `--json` and
+one-shot renders can be scoped without a terminal: `git-roost --repo wings
+--filter dirty --json` is one repo's uncommitted trees, nothing else. `--filter`
+also seeds `-w`'s starting view — `f` still cycles from there.
+
+`--check` is a different shape entirely: no table, no `--filter`, just an exit
+code. It answers one question — does anything here need a human before an
+agent starts working in it — as pass/fail, for hooks and scripts rather than a
+person reading a screen. `0` means every tree is at worst `UNPUSHED` or
+`BEHIND`; `1` means at least one is `MID-OPERATION`, `DIVERGED`, or has
+`UNCOMMITTED` work, and those trees print (or `--json` them) so the caller
+knows which. `--root`/`--repo` still scope the scan — a pre-flight check
+before dispatching one agent into one repo shouldn't have to reason about the
+whole fleet.
+
+```bash
+git-roost --repo counting-chicken-wings --check || echo "not clean, look first"
+```
 
 Keys need a terminal. Piped, redirected, or on a box with neither `termios` nor
 `msvcrt`, watch mode degrades to the plain timer redraw rather than failing, and
