@@ -159,18 +159,26 @@ if [ -f packaging/git-roost.rb ]; then
         # The asset exists. Compare -- but NEVER gate on the result, because a
         # mismatch here is the normal, structurally guaranteed state, not drift.
         #
-        # The sdist ships packaging/ (see [tool.hatch.build.targets.sdist] in
-        # pyproject.toml), so git-roost.rb is INSIDE the tarball being hashed.
-        # Writing the asset's true digest into the formula changes the tarball,
-        # which changes the digest. "The formula's sha256 equals the hash of an
-        # sdist containing that same sha256" is a hash fixed point: not
-        # findable, so on the commit a release is cut from these two values
-        # cannot agree. Failing the build on that would mean demanding the
-        # impossible.
+        # The plain reason is causality: the digest of a release asset does not
+        # exist on the commit the release is cut FROM. The asset is built from
+        # that commit. So no value committed here could ever have matched, and
+        # there was never a version of this assertion that could pass on a
+        # pre-release commit.
         #
-        # It also made release.yml un-re-runnable: a re-run for an
-        # already-published tag (retrying after npm or the tap failed on a
-        # one-time-setup gap) fetches 200, compared stale-vs-real, exited 1, and
+        # There is a second, independent reason, and it is worth naming so that
+        # nobody "fixes" the first one and expects the gate back. The sdist ships
+        # packaging/ (see [tool.hatch.build.targets.sdist] in pyproject.toml), so
+        # git-roost.rb is INSIDE the tarball being hashed. Writing the asset's
+        # true digest into the formula changes the tarball, which changes the
+        # digest. "The formula's sha256 equals the hash of an sdist containing
+        # that same sha256" is a hash fixed point: not findable. Dropping
+        # packaging/ from the sdist would break the fixed point and still leave
+        # the causality problem untouched. Neither is the kind of thing a build
+        # should fail on.
+        #
+        # The re-run symptom that surfaced all this: a re-run of release.yml for
+        # an already-published tag (retrying after npm or the tap failed on a
+        # one-time-setup gap) fetched 200, compared stale-vs-real, exited 1, and
         # killed the build job before anything downstream could retry -- exactly
         # when a re-run matters most.
         #
@@ -178,11 +186,14 @@ if [ -f packaging/git-roost.rb ]; then
         # clear about. The case this script was written for -- a formula left
         # behind on an OLDER release -- is caught by the `git-roost.rb version`
         # and `git-roost.rb literals` checks above, which compare against
-        # __version__ directly, offline, and DO fail. The digest never carried
-        # that signal. And the digest users actually install is not this one:
-        # the homebrew-tap job in release.yml computes sha256sum over the local
-        # sdist, rewrites the formula, and asserts the value it wrote before
-        # pushing to the tap. That job is the authority; this line is a report.
+        # __version__ directly, offline, and DO fail. Verified: a formula pinned
+        # at 0.0.9 exits 1 on those two lines while this digest comparison is
+        # reporting "matches". The digest never carried that signal.
+        #
+        # And the digest users actually install is not this one: the homebrew-tap
+        # job in release.yml computes sha256sum over the local sdist, rewrites
+        # the formula, and asserts the value it wrote before pushing to the tap.
+        # That job is the authority; this line is a report.
         actual=$(shasum -a 256 "$tmp" | cut -d' ' -f1)
         if [ "$actual" = "$rb_sha" ]; then
           # Reachable, and good news when it happens: a post-release commit that
@@ -192,7 +203,8 @@ if [ -f packaging/git-roost.rb ]; then
         else
           printf '  --    %-24s differs from the published sdist, which is expected:\n' \
             "git-roost.rb sha256"
-          printf '        the sdist contains this file, so the digest cannot match itself.\n'
+          printf '        expected: an asset digest cannot exist on the commit it is built\n'
+          printf '        from, and the sdist ships this file, so it cannot match itself.\n'
           printf '        published %s\n' "$actual"
           printf '        in repo   %s\n' "$rb_sha"
           printf '        The homebrew-tap job computes and asserts the real one at push time.\n'
