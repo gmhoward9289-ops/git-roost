@@ -75,8 +75,14 @@ __version__ = "0.1.0"
 HOME = Path.home()
 
 # ~/GitHub is where every repo on this machine lives. Overridable because that
-# is a fact about one box, not about git.
-DEFAULT_ROOTS = (HOME / "GitHub",)
+# is a fact about one box, not about git -- GIT_ROOST_ROOT for the daily
+# default (os.pathsep-separated for more than one root, matching PATH), --root
+# for a one-off override.
+_env_roots = os.environ.get("GIT_ROOST_ROOT")
+if _env_roots:
+    DEFAULT_ROOTS = tuple(Path(p).expanduser() for p in _env_roots.split(os.pathsep) if p)
+else:
+    DEFAULT_ROOTS = (HOME / "GitHub",)
 
 # How deep to look for a repo below a root. Worktrees live at
 # <root>/.worktrees/<repo>/<slug>, which is depth 3, so 3 is the floor and the
@@ -964,21 +970,47 @@ def scan(args):
 
 
 def body(args, width, view=None):
-    """One frame. `view` is the live watch state; None means the flags alone.
+    """One frame plus the states it was built from. `view` is the live watch
+    state; None means the flags alone.
 
-    The one-shot path passes None and renders exactly what 0.1 rendered. That is
-    the contract behind `git-roost | less` and `git-roost --json | jq`: keys move
-    the watch view and nothing else.
+    The one-shot path passes None and renders exactly what 0.1 rendered, plus
+    whatever --sort/--filter were given -- those are static flags, not watch
+    state, so they apply identically to the piped path. That is the contract
+    behind `git-roost | less` and `git-roost --json | jq`: keys move the watch
+    view and nothing else. States come back alongside the lines so --fail-on
+    can inspect the fleet without a second scan.
     """
     states = scan(args)
     if args.json:
-        return [json.dumps(states, indent=2, sort_keys=True)]
+        return [json.dumps(states, indent=2, sort_keys=True)], states
     if args.log is not None:
-        return render_log(states, args.log, width)
+        return render_log(states, args.log, width), states
     if view is None:
-        return render(states, width, expand_quiet=args.all)
+        return render(states, width, expand_quiet=args.all,
+                      sort_mode=args.sort, filt=args.filter), states
     return render(states, width, expand_quiet=view["quiet"],
-                  sort_mode=view["sort"], filt=view["filter"])
+                  sort_mode=view["sort"], filt=view["filter"]), states
+
+
+def exit_code(states, fail_on):
+    """0 unless --fail-on names a condition present in the (unfiltered) fleet.
+
+    Checked against the whole fleet, not a --filter view, for the same reason
+    the summary line always says both counts: a hook that asked "is anything
+    stuck" should not get a false "no" because someone also passed --filter
+    dirty for a human to read at the same time.
+    """
+    if not fail_on or fail_on == "none":
+        return 0
+    for st in states:
+        order, _ = bucket(st)
+        if fail_on == "stuck" and order == 0:
+            return 1
+        if fail_on == "diverged" and order <= 1:
+            return 1
+        if fail_on == "dirty" and order <= 2:
+            return 1
+    return 0
 
 
 def main(argv=None):
@@ -1001,9 +1033,19 @@ def main(argv=None):
                     help="commit feed across every repo, newest first (default 25)")
     ap.add_argument("-a", "--all", action="store_true", help="expand the QUIET group")
     ap.add_argument("--root", action="append", metavar="DIR",
-                    help="where to look for repos (repeatable; default ~/GitHub)")
+                    help="where to look for repos (repeatable; default $GIT_ROOST_ROOT or ~/GitHub)")
     ap.add_argument("--depth", type=int, default=DEFAULT_DEPTH, metavar="N",
                     help="how deep to search below each root (default %d)" % DEFAULT_DEPTH)
+    ap.add_argument("--sort", choices=SORT_MODES, default=SORT_MODES[0],
+                    help="sort within each group (default %s)" % SORT_MODES[0])
+    ap.add_argument("--filter", choices=FILTER_MODES, default=FILTER_MODES[0],
+                    help="subtractive view of the table (default %s)" % FILTER_MODES[0])
+    ap.add_argument("--fail-on", choices=("none", "dirty", "diverged", "stuck"),
+                    default="none", metavar="COND",
+                    help="exit 1 if the fleet has a tree matching COND: stuck "
+                         "(mid-operation), diverged (mid-operation or ahead+behind "
+                         "a base), dirty (also uncommitted work). Checked against "
+                         "the whole fleet, not --filter. Default none (always 0).")
     ap.add_argument("--json", action="store_true", help="emit records as JSON")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
     args = ap.parse_args(argv)
@@ -1024,20 +1066,26 @@ def main(argv=None):
 
     if args.once or not args.watch:
         width = shutil.get_terminal_size((160, 24)).columns
-        print("\n".join(body(args, width)))
-        return 0
+        lines, states = body(args, width)
+        print("\n".join(lines))
+        return exit_code(states, args.fail_on)
 
     # Live view state, separate from args: the flags are the starting position
-    # and the keys move from there. --all seeds the quiet toggle, so `-a -w`
-    # opens expanded and `a` still collapses it.
-    view = {"sort": SORT_MODES[0], "filter": FILTER_MODES[0], "quiet": args.all}
+    # and the keys move from there. --all seeds the quiet toggle and --sort/
+    # --filter seed the sort/filter, so `-a -w` opens expanded and `a` still
+    # collapses it, and the keys still cycle from wherever the flags started.
+    view = {"sort": args.sort, "filter": args.filter, "quiet": args.all}
     helping = False
+    last_states = []
 
     try:
         with Keys() as keys:
             while True:
                 width = shutil.get_terminal_size((160, 24)).columns
-                out = help_lines() if helping else body(args, width, view)
+                if helping:
+                    out = help_lines()
+                else:
+                    out, last_states = body(args, width, view)
                 if ansi:
                     sys.stdout.write("\033[H\033[2J")
                 else:
@@ -1063,7 +1111,7 @@ def main(argv=None):
                 helping = action == "help"
     except KeyboardInterrupt:
         pass
-    return 0
+    return exit_code(last_states, args.fail_on)
 
 
 if __name__ == "__main__":

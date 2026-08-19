@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -701,13 +701,16 @@ class TestWatchKeys(unittest.TestCase):
             all = False
             root = None
             depth = git_roost.DEFAULT_DEPTH
+            sort = git_roost.SORT_MODES[0]
+            filter = git_roost.FILTER_MODES[0]
 
         with tempfile.TemporaryDirectory() as tmp:
             args = Args()
             args.root = [tmp]
             view = {"sort": "repo", "filter": "dirty", "quiet": True}
-            self.assertEqual(git_roost.body(args, 200, view),
-                             ["no git repositories found"])
+            lines, states = git_roost.body(args, 200, view)
+            self.assertEqual(lines, ["no git repositories found"])
+            self.assertEqual(states, [])
 
     def test_body_without_a_view_renders_the_one_shot_table(self):
         # The contract behind `git-roost | less` and `git-roost --json | jq`:
@@ -718,11 +721,15 @@ class TestWatchKeys(unittest.TestCase):
             all = False
             root = None
             depth = git_roost.DEFAULT_DEPTH
+            sort = git_roost.SORT_MODES[0]
+            filter = git_roost.FILTER_MODES[0]
 
         with tempfile.TemporaryDirectory() as tmp:
             args = Args()
             args.root = [tmp]
-            self.assertEqual(git_roost.body(args, 200), ["no git repositories found"])
+            lines, states = git_roost.body(args, 200)
+            self.assertEqual(lines, ["no git repositories found"])
+            self.assertEqual(states, [])
 
 
 class TestCli(unittest.TestCase):
@@ -774,6 +781,76 @@ class TestCli(unittest.TestCase):
                 git_roost.main(["--root", tmp, "--json"])
             data = json.loads(buf.getvalue())
             self.assertEqual(set(data[0]), EXPECTED)
+
+    def test_sort_and_filter_flags_reach_the_one_shot_render(self):
+        # SORT_MODES/FILTER_MODES were only ever reachable from watch-mode keys.
+        # These flags are the scriptable path onto the same machinery.
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = git_roost.main(["--root", tmp, "--filter", "dirty"])
+            self.assertEqual(rc, 0)
+            self.assertIn("no tree matches filter: uncommitted", buf.getvalue())
+
+    def test_sort_and_filter_reject_unknown_values(self):
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                git_roost.main(["--sort", "bogus"])
+
+
+class TestExitCode(unittest.TestCase):
+    def _state(self, operation="", ahead=0, behind=0, tracked=0):
+        return {
+            "operation": operation, "ahead": ahead, "behind": behind,
+            "tracked": tracked, "last_ts": None,
+        }
+
+    def test_none_is_always_zero(self):
+        self.assertEqual(git_roost.exit_code([self._state(operation="rebase")], "none"), 0)
+
+    def test_stuck_only_fires_on_mid_operation(self):
+        self.assertEqual(git_roost.exit_code([self._state(ahead=1, behind=1)], "stuck"), 0)
+        self.assertEqual(git_roost.exit_code([self._state(operation="rebase")], "stuck"), 1)
+
+    def test_diverged_fires_on_stuck_or_diverged_but_not_merely_dirty(self):
+        self.assertEqual(git_roost.exit_code([self._state(tracked=3)], "diverged"), 0)
+        self.assertEqual(git_roost.exit_code([self._state(ahead=1, behind=1)], "diverged"), 1)
+        self.assertEqual(git_roost.exit_code([self._state(operation="merge")], "diverged"), 1)
+
+    def test_dirty_fires_on_uncommitted_work_too(self):
+        self.assertEqual(git_roost.exit_code([self._state(tracked=3)], "dirty"), 1)
+        self.assertEqual(git_roost.exit_code([self._state()], "dirty"), 0)
+
+    def test_checked_against_the_whole_fleet_not_a_filtered_view(self):
+        # A hook asking --fail-on stuck must not get a false 0 just because the
+        # caller also passed --filter for a human to read at the same time.
+        fleet = [self._state(), self._state(operation="rebase")]
+        self.assertEqual(git_roost.exit_code(fleet, "stuck"), 1)
+
+
+class TestRootEnvVar(unittest.TestCase):
+    def test_git_roost_root_overrides_the_default(self):
+        env = {k: v for k, v in os.environ.items() if k != "GIT_ROOST_ROOT"}
+        env["GIT_ROOST_ROOT"] = str(Path("/tmp/one")) + os.pathsep + str(Path("/tmp/two"))
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import git_roost; "
+             "print([str(p) for p in git_roost.DEFAULT_ROOTS])" % str(ROOT)],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertIn("one", out.stdout)
+        self.assertIn("two", out.stdout)
+
+    def test_default_root_when_unset(self):
+        env = {k: v for k, v in os.environ.items() if k != "GIT_ROOST_ROOT"}
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import git_roost; "
+             "print([str(p) for p in git_roost.DEFAULT_ROOTS])" % str(ROOT)],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertIn("GitHub", out.stdout)
 
     @needs_git
     def test_log_feed_does_not_repeat_a_commit_per_worktree(self):

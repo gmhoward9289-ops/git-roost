@@ -89,6 +89,8 @@ git-roost --log          # commit feed across every repo, newest first
 git-roost --all          # expand the QUIET group
 git-roost --json         # records, for piping somewhere else
 git-roost --root ~/src   # look somewhere other than ~/GitHub (repeatable)
+git-roost --sort work --filter dirty   # the watch-mode sort/filter, one-shot and scriptable
+git-roost --fail-on stuck              # exit 1 if any tree is mid-operation -- a pre-flight gate
 ```
 
 Watch mode takes keys:
@@ -111,6 +113,20 @@ Keys need a terminal. Piped, redirected, or on a box with neither `termios` nor
 `msvcrt`, watch mode degrades to the plain timer redraw rather than failing, and
 the default one-shot render touches no terminal settings at all — which is what
 keeps `git-roost | less` and `git-roost --json | jq` safe.
+
+`--sort` and `--filter` are the same machinery the `s`/`f` keys cycle through,
+reachable without a terminal at all — `--filter stuck --json` is the scriptable
+form of "is anything stuck," and `-w --sort work --filter dirty` opens watch
+mode already positioned there instead of requiring a few keypresses first.
+
+`--fail-on {stuck,diverged,dirty}` turns the exit code into a pre-flight gate:
+nonzero when the *whole fleet* (never the `--filter` view — a hook asking "is
+anything stuck" should not get a false 0 just because a human also filtered the
+table they're looking at) has a tree matching the condition. `stuck` is
+mid-operation only; `diverged` adds ahead-and-behind; `dirty` adds uncommitted
+work on top of that. Useful as the same kind of stale-tree gate `git-roost`
+itself exists to answer, wired into a pre-agent-fanout hook instead of a human
+reading a table.
 
 ## Reading the table
 
@@ -158,13 +174,15 @@ know which is authoritative, and a confident wrong baseline is worse than `-`.
 
 ## Configuration
 
-Two environment variables, both about how hard to push a slow disk rather than
-about git.
-
 | Variable | Default | What it does |
 |---|---|---|
+| `GIT_ROOST_ROOT` | `~/GitHub` | where to look for repos, `os.pathsep`-separated for more than one (same convention as `PATH`) — `--root` overrides it for one call |
 | `GIT_ROOST_TIMEOUT` | `5` | seconds any single git call may take before it is abandoned |
 | `GIT_ROOST_WORKERS` | `12` | how many trees are scanned in parallel |
+
+No dotfile or config file, deliberately — every setting here is an env var or a
+flag, matching roost, leghorn and legbar. The timeout and worker count are both
+about how hard to push a slow disk rather than about git.
 
 The timeout is a ceiling on one call, not on the scan. A tree behind a stalled
 network mount is dropped rather than allowed to hold the whole table hostage —
