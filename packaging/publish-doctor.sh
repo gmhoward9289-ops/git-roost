@@ -252,7 +252,7 @@ else
   # primary -- and the interpolation has to be expanded before anything can be
   # fetched from it.
   tap_ver=$(printf '%s\n' "$tap_rb" | sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' | head -1)
-  tap_url=$(printf '%s\n' "$tap_rb" | sed -n 's/.*url "\([^"]*\)".*/\1/p' | head -1)
+  tap_url=$(printf '%s\n' "$tap_rb" | sed -n 's/^[[:space:]]*url "\([^"]*\)".*/\1/p' | head -1)
   if [ -z "$tap_ver" ]; then
     tap_ver=$(printf '%s\n' "$tap_url" | sed -n 's#.*/v\([0-9][^/]*\)\.tar\.gz$#\1#p')
   fi
@@ -268,7 +268,7 @@ else
     tmp=$(mktemp)
     if curl -sfL --max-time 60 "$tap_url" -o "$tmp" 2>/dev/null; then
       got=$(sha256_of "$tmp")
-      want=$(printf '%s\n' "$tap_rb" | sed -n 's/.*sha256 "\([^"]*\)".*/\1/p' | head -1)
+      want=$(printf '%s\n' "$tap_rb" | sed -n 's/^[[:space:]]*sha256 "\([^"]*\)".*/\1/p' | head -1)
       if [ "$got" = "$want" ]; then
         pass brew "brew install $OWNER/tap/$DIST ($tap_ver, sha256 verified)"
       else
