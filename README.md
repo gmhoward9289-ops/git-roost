@@ -89,8 +89,10 @@ git-roost --log          # commit feed across every repo, newest first
 git-roost --all          # expand the QUIET group
 git-roost --json         # records, for piping somewhere else
 git-roost --root ~/src   # look somewhere other than ~/GitHub (repeatable)
-git-roost --repo wings --filter dirty   # scope to one repo, one view
-git-roost --check        # no table -- exit 1 if any tree needs a human first
+git-roost --repo wings --sort work --filter dirty   # scope, sort and filter together
+git-roost --check                      # no table -- exit 1 if any tree needs a human first
+git-roost --fail-on stuck              # like --check, but keeps the normal table
+git-roost --github                     # add a PR/CI column, via `gh` (opt-in: network calls)
 ```
 
 Watch mode takes keys:
@@ -102,37 +104,104 @@ Watch mode takes keys:
 | `s` | sort: recent / repo / work |
 | `f` | filter: all / uncommitted / mid-operation |
 | `a` | expand or collapse `QUIET` |
+| `l` | toggle the fleet table and the commit feed, without restarting |
+| `j` / `k` | move the row cursor down / up |
+| `enter` | open a detail view for the highlighted tree |
 | `q` | quit |
 
 Sort cycles *within* a group and never across one. The group order is the whole
 argument this tool makes — cost of ignoring, not recency or size — so a sort
 that let an `ACTIVE` tree float above a `MID-OPERATION` one would be quietly
-answering a different question.
+answering a different question. Changing sort, filter or the quiet toggle
+resets the row cursor rather than leaving it pointing at whatever row happens
+to land underneath it.
 
-`--repo NAME` (repeatable, case-insensitive substring) and `--filter
-{all,dirty,stuck}` put the `f` key's view on the command line, so `--json` and
-one-shot renders can be scoped without a terminal: `git-roost --repo wings
---filter dirty --json` is one repo's uncommitted trees, nothing else. `--filter`
-also seeds `-w`'s starting view — `f` still cycles from there.
+`l` used to be a restart: `--log` decided table-or-feed once, at launch. Now
+it just seeds the initial view — `git-roost --log -w` opens on the feed, and
+`git-roost -w` opens on the table — and `l` flips between the two live,
+without losing the scan already in flight.
 
-`--check` is a different shape entirely: no table, no `--filter`, just an exit
-code. It answers one question — does anything here need a human before an
-agent starts working in it — as pass/fail, for hooks and scripts rather than a
-person reading a screen. `0` means every tree is at worst `UNPUSHED` or
-`BEHIND`; `1` means at least one is `MID-OPERATION`, `DIVERGED`, or has
-`UNCOMMITTED` work, and those trees print (or `--json` them) so the caller
-knows which. `--root`/`--repo` still scope the scan — a pre-flight check
-before dispatching one agent into one repo shouldn't have to reason about the
-whole fleet.
+`j`/`k` move a highlighted row through whatever the table is currently
+showing — same sort, same filter, same QUIET collapse everyone else sees.
+`enter` opens a detail screen for that tree: its whole stash list rather than
+just a count, a diffstat of the most recent stash, what it's stuck doing if
+anything, and its last five commits. Any other key returns to the table, the
+same way dismissing the `?` overlay does — one dismissal convention, not two.
 
-```bash
-git-roost --repo counting-chicken-wings --check || echo "not clean, look first"
-```
+Two consecutive frames of an idle fleet used to be indistinguishable from each
+other, which is a strange thing for a tool named after `top`. Now a row whose
+group, `WORK` or `DRIFT` changed since the last redraw is marked with a
+leading `*`, so watching quietly still tells you when something moved.
+
+`--repo NAME` (repeatable, case-insensitive substring), `--sort` and `--filter`
+put the `f`/`s` keys' view on the command line, so `--json` and one-shot
+renders can be scoped without a terminal — `git-roost --repo wings --filter
+dirty --json` is one repo's uncommitted trees, nothing else. Both also seed
+`-w`'s starting view, so `-w --sort work --filter dirty` opens watch mode
+already positioned there and the keys still cycle from it.
 
 Keys need a terminal. Piped, redirected, or on a box with neither `termios` nor
 `msvcrt`, watch mode degrades to the plain timer redraw rather than failing, and
 the default one-shot render touches no terminal settings at all — which is what
 keeps `git-roost | less` and `git-roost --json | jq` safe.
+
+Two exit-code flags, for two different hook shapes:
+
+- **`--check`** is a different shape entirely from the table: no `--filter`,
+  just pass/fail. `0` means every tree is at worst `UNPUSHED` or `BEHIND`; `1`
+  means at least one is `MID-OPERATION`, `DIVERGED`, or has `UNCOMMITTED` work
+  — and those offending trees print (or `--json` them), so the caller knows
+  which, without reading a full table. `--root`/`--repo` still scope the scan.
+
+  ```bash
+  git-roost --repo counting-chicken-wings --check || echo "not clean, look first"
+  ```
+
+- **`--fail-on {stuck,diverged,dirty}`** is `--check` with the threshold made
+  a choice, and without replacing the table: it prints the normal render (or
+  the normal `--json`) and only changes the exit code, checked against the
+  *whole fleet* (never the `--filter` view — a hook asking "is anything
+  stuck" should not get a false 0 just because a human also filtered the
+  table they're looking at). `stuck` is mid-operation only; `diverged` adds
+  ahead-and-behind; `dirty` (equivalent to `--check`'s fixed threshold) adds
+  uncommitted work on top of that.
+
+  ```bash
+  git-roost -w --fail-on stuck   # a human's normal view, that also exits 1
+  ```
+
+### `--github`
+
+Opt-in, not on by default. The local scan is disk-only and fast; PR and CI
+state is a network call to GitHub through the `gh` CLI, with a meaningfully
+different latency and trust profile, so it never runs unless asked.
+
+```bash
+git-roost --github                     # one-shot table with a PR column
+git-roost -w --github                  # watch mode; PR/CI refreshed every 30s
+git-roost -w --github --github-interval 10   # refresh PR/CI more often
+git-roost --json --github              # pr_number/pr_state/pr_draft/pr_review/pr_ci per tree
+```
+
+Each tree's current branch is looked up with a single `gh pr view` call, run
+from inside that tree so `gh` resolves "the PR for this branch" itself. It
+degrades the same way `git()` does: no `gh` on `PATH`, no auth, no GitHub
+remote, no open PR, a rate limit, or a slow network are all just "we don't
+know" for that one tree — a blank `PR` column and, in `--json`, `null` values
+rather than a missing key or a crashed scan. The calls go through `gh_call()`,
+a wrapper as careful as `git()`'s: an allowlist keyed on `gh`'s subcommand
+(`pr view` / `pr list` / `pr status` only — nothing that could merge, close,
+edit, or comment), checked before the subprocess ever runs.
+
+In watch mode, PR/CI data is cached and refreshed on its own interval
+(`--github-interval`, default 30s) rather than on every redraw (default 3s):
+the local git scan is cheap enough to run every frame, but `gh` is a
+rate-limited network call and a PR's review state rarely changes inside a 3s
+window.
+
+`--json` only gains the five `pr_*` keys when `--github` was passed — the
+default JSON shape is unchanged for any consumer that never asks for GitHub
+data.
 
 ## Reading the table
 
@@ -158,6 +227,8 @@ Columns:
   `-` means *unknown*, never *in sync*.
 - **STASH** — stash entries, blank when there are none.
 - **LAST** — age of the last commit.
+- **PR** — only with `--github`. `#123` open, `#123+` CI green, `#123x` CI red,
+  `#123~` CI still running, `#123 draft`, blank when there is no open PR.
 
 ### Finding the baseline
 
@@ -180,13 +251,20 @@ know which is authoritative, and a confident wrong baseline is worse than `-`.
 
 ## Configuration
 
-Two environment variables, both about how hard to push a slow disk rather than
-about git.
-
 | Variable | Default | What it does |
 |---|---|---|
+| `GIT_ROOST_ROOT` | `~/GitHub` | where to look for repos, `os.pathsep`-separated for more than one (same convention as `PATH`) — `--root` overrides it for one call |
 | `GIT_ROOST_TIMEOUT` | `5` | seconds any single git call may take before it is abandoned |
 | `GIT_ROOST_WORKERS` | `12` | how many trees are scanned in parallel |
+| `GIT_ROOST_GH_TIMEOUT` | `8` | seconds any single `gh` call may take before it is abandoned (only with `--github`) |
+| `GIT_ROOST_GH_WORKERS` | `4` | how many `gh` calls run in parallel (only with `--github`; its own, smaller pool so a slow `gh` never starves the git scan) |
+
+No dotfile or config file, deliberately — every setting here is an env var or a
+flag, matching roost, leghorn and legbar. The timeout and worker count are both
+about how hard to push a slow disk rather than about git. The `GH` pair is
+separate on purpose: `gh` is a network call with its own, longer timeout and
+its own, smaller worker cap, and both are irrelevant unless `--github` is
+passed.
 
 The timeout is a ceiling on one call, not on the scan. A tree behind a stalled
 network mount is dropped rather than allowed to hold the whole table hostage —

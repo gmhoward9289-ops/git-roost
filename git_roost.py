@@ -18,10 +18,13 @@ uncommitted work nobody has looked at, who is stuck mid-rebase.
     git-roost --json         # records, for piping somewhere else
     git-roost --repo wings --filter dirty   # scope to one repo, one view
     git-roost --check        # exit 1 if anything needs a human first; for hooks
+    git-roost --github       # add a PR/CI column, via `gh` (opt-in, network)
 
 Watch mode takes keys -- `?` for the map, `r` refresh, `s` sort, `f` filter, `a`
-quiet, `q` quit. The default one-shot render takes none and touches no terminal
-settings at all, which is what keeps it safe to pipe.
+quiet, `l` toggles the table for the commit feed, `j`/`k` move a row cursor,
+`enter` opens a detail view for the highlighted tree, `q` quit. The default
+one-shot render takes none and touches no terminal settings at all, which is
+what keeps it safe to pipe.
 
 One file, no dependencies, Python 3.9+, macOS/Linux/Windows -- the same
 constraints as roost, for the same reason: it has to run on whatever Python is
@@ -32,6 +35,12 @@ refuses anything outside READ_ONLY -- so the tool cannot mutate a tree, an index
 or a ref even if a future edit tries to. The allowlist is keyed on the
 subcommand *and* its first argument, because `stash list` and `stash pop` are
 not the same kind of thing. tests/test_git_roost.py asserts that policy directly.
+
+`--github` is a second, separate opt-in: it shells out to `gh` for PR and CI
+state, which is a network call with its own latency and trust profile, so it
+never runs unless asked. Those calls go through gh_call(), a read-only wrapper
+in the same spirit as git() but keyed to gh's own danger surface -- see the
+"github (gh)" section below.
 """
 
 from __future__ import annotations
@@ -77,8 +86,14 @@ __version__ = "0.2.0"
 HOME = Path.home()
 
 # ~/GitHub is where every repo on this machine lives. Overridable because that
-# is a fact about one box, not about git.
-DEFAULT_ROOTS = (HOME / "GitHub",)
+# is a fact about one box, not about git -- GIT_ROOST_ROOT for the daily
+# default (os.pathsep-separated for more than one root, matching PATH), --root
+# for a one-off override.
+_env_roots = os.environ.get("GIT_ROOST_ROOT")
+if _env_roots:
+    DEFAULT_ROOTS = tuple(Path(p).expanduser() for p in _env_roots.split(os.pathsep) if p)
+else:
+    DEFAULT_ROOTS = (HOME / "GitHub",)
 
 # How deep to look for a repo below a root. Worktrees live at
 # <root>/.worktrees/<repo>/<slug>, which is depth 3, so 3 is the floor and the
@@ -102,6 +117,18 @@ NESTED_WORKTREE_DIRS = (".worktrees", Path(".claude") / "worktrees")
 GIT_TIMEOUT = float(os.environ.get("GIT_ROOST_TIMEOUT") or 5)
 GIT_WORKERS = int(os.environ.get("GIT_ROOST_WORKERS") or 12)
 
+# gh hits the network, so it gets its own, longer timeout and its own, smaller
+# worker cap -- same GIT_ROOST_* naming convention as the two above. A slow or
+# rate-limited `gh` must never be allowed to starve the local git scan, which
+# is why this is a separate pool rather than sharing GIT_WORKERS.
+GH_TIMEOUT = float(os.environ.get("GIT_ROOST_GH_TIMEOUT") or 8)
+GH_WORKERS = int(os.environ.get("GIT_ROOST_GH_WORKERS") or 4)
+
+# Resolved once at import, not on every call: `gh` either exists on this box or
+# it doesn't, and --github degrades to a blank column / null JSON keys when it
+# is missing rather than erroring partway through a scan.
+GH_PATH = shutil.which("gh")
+
 # A commit this recent means someone is working in the tree right now.
 ACTIVE_SECS = 3600
 
@@ -113,6 +140,7 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 BLUE = "\033[34m"
 CYAN = "\033[36m"
+MAGENTA = "\033[35m"
 
 COLOR = False
 
@@ -658,7 +686,27 @@ COLUMNS = (
 )
 
 
-def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"):
+def visible_rows(states, expand_quiet=False, sort_mode="recent", filt="all"):
+    """Sorted, filtered rows with QUIET collapsed away -- exactly what render()
+    draws as its table.
+
+    Watch mode's cursor walks this same list, kept as its own function so `j`/
+    `k` land on a row that is actually on screen instead of drifting out of
+    sync with render()'s own filtering the next time one of the two changes.
+    """
+    if filt != "all":
+        states = [s for s in states if passes_filter(s, filt)]
+    rows = sorted(states, key=lambda st: sort_key(st, sort_mode))
+    return [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
+
+
+def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all",
+           changed=None, github=False):
+    """`changed` is a set of tree paths whose bucket, WORK or DRIFT differ from
+    the previous watch-mode frame -- see frame_signature(). None outside watch
+    mode, where there is no previous frame to compare against. `github` adds
+    the opt-in PR/CI column -- see GITHUB_COLUMN.
+    """
     if not states:
         return ["no git repositories found"]
 
@@ -673,11 +721,16 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
     shown = [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
     quiet = [s for s in rows if bucket(s)[1] == "QUIET" and not expand_quiet]
 
-    cells = [[fn(s) for _, fn in COLUMNS] for s in shown]
-    headers = [h for h, _ in COLUMNS]
+    # The PR/CI column is opt-in: appended rather than baked into COLUMNS, so
+    # the default table is byte-for-byte what it always was for anyone who
+    # never passes --github.
+    columns = COLUMNS + (GITHUB_COLUMN,) if github else COLUMNS
+
+    cells = [[fn(s) for _, fn in columns] for s in shown]
+    headers = [h for h, _ in columns]
     widths = [
         max([len(headers[i])] + [row[i] and len(row[i]) or 0 for row in cells] or [0])
-        for i in range(len(COLUMNS))
+        for i in range(len(columns))
     ]
 
     used = sum(widths) + 2 * len(widths) + 2
@@ -685,7 +738,7 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
 
     lines = []
     lines.append(c("  " + "  ".join(
-        headers[i].ljust(widths[i]) for i in range(len(COLUMNS))
+        headers[i].ljust(widths[i]) for i in range(len(columns))
     ) + "  " + "SUBJECT", BOLD))
 
     current = None
@@ -704,8 +757,13 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
             subject += " **"
         if len(subject) > subject_w:
             subject = subject[: subject_w - 3] + "..."
-        body = "  ".join(row[i].ljust(widths[i]) for i in range(len(COLUMNS)))
-        lines.append("  " + body + "  " + subject)
+        body = "  ".join(row[i].ljust(widths[i]) for i in range(len(columns)))
+        is_changed = bool(changed) and st["path"] in changed
+        marker = "* " if is_changed else "  "
+        line = marker + body + "  " + subject
+        if is_changed:
+            line = c(line, MAGENTA, BOLD)
+        lines.append(line)
 
     if quiet:
         names = " . ".join(sorted({"%s/%s" % (s["repo"], s["tree"]) for s in quiet}))
@@ -823,6 +881,273 @@ def render_log(states, limit, width=160):
     return lines
 
 
+def frame_signature(st):
+    """What "changed since last frame" means: bucket, WORK and DRIFT.
+
+    Not the whole state dict -- LAST ticks every second and would mark every
+    row changed on every redraw, which is the opposite of a "what moved"
+    signal.
+    """
+    return (bucket(st)[1], work(st), drift(st))
+
+
+def detail_lines(st, width=160):
+    """Everything one tree has that the table has no room for: the whole
+    stash list rather than a count, what it is stuck doing, and its last five
+    commits.
+
+    Read-only, same as everywhere else -- `stash list` and `stash show -p` are
+    both on the READ_ONLY allowlist, and commits come from the already-allowed
+    `commits_for()`.
+    """
+    lines = [c("%s/%s" % (st["repo"], st["tree"]), BOLD)]
+    lines.append(("@" + st["branch"]) if st["detached"] else (st["branch"] or "-"))
+    lines.append(st["path"])
+    lines.append("")
+
+    if st["operation"]:
+        op_line = "** %s in progress **" % st["operation"]
+        if st["conflicts"]:
+            op_line += "  (%d conflict(s))" % st["conflicts"]
+        lines.append(c(op_line, RED, BOLD))
+        lines.append("")
+
+    lines.append(c("STASH", BOLD))
+    stash_out = git(st["path"], "stash", "list")
+    entries = [ln for ln in (stash_out or "").splitlines() if ln]
+    if not entries:
+        lines.append("  (none)")
+    else:
+        for entry in entries:
+            lines.append("  " + ascii_safe(entry))
+        # The most recent stash is the one someone is most likely to come back
+        # for, so it is the one worth a diffstat rather than just a subject
+        # line. `-p` is capped at 30 lines -- enough to see what is in it
+        # without dumping a whole patch into a table-shaped screen.
+        patch = git(st["path"], "stash", "show", "-p", "stash@{0}")
+        if patch:
+            diff_lines = patch.splitlines()
+            lines.append("")
+            lines.append(c("  stash@{0}:", DIM))
+            for dl in diff_lines[:30]:
+                lines.append("  " + ascii_safe(dl))
+            if len(diff_lines) > 30:
+                lines.append("  ... %d more line(s)" % (len(diff_lines) - 30))
+    lines.append("")
+
+    lines.append(c("LAST 5 COMMITS", BOLD))
+    commits = commits_for(st, 5)
+    if not commits:
+        lines.append("  (no commits)")
+    else:
+        now = time.time()
+        for r in commits:
+            lines.append("  %s  %s  %s" % (
+                dur(now - r["ts"]).ljust(4), r["hash"].ljust(7),
+                ascii_safe(r["subject"])))
+    lines.append("")
+    lines.append(c("any other key returns to the table", DIM))
+    return lines
+
+
+# ---------------------------------------------------------------- github (gh)
+
+# What this tool is allowed to run through `gh`: command -> (permitted
+# subcommands, most positional arguments a read-only form can take).
+#
+# gh does not have git's flag-laundering problem -- `symbolic-ref --short HEAD
+# X` rewrites HEAD despite opening with a read flag, but no flag turns
+# `gh pr view` into a write. Every gh operation that mutates a PR (merge,
+# close, edit, ready, review, comment) is a separate subcommand, not a flag on
+# list/view/status. So the allowlist only needs (command, subcommand); the
+# positional cap is still here as the same fail-closed backstop check_read_only
+# uses -- a future call site that starts interpolating a bare argument where a
+# flag value belongs gets refused rather than silently let through.
+GH_READ_ONLY = {
+    "pr": (frozenset(("view", "list", "status")), 0),
+}
+
+
+def check_gh_read_only(args):
+    """Raise unless args is a form of `gh` that cannot modify anything.
+
+    Split out from gh_call() for the same reason check_read_only() is split
+    from git(): so the test suite can assert the policy directly, and because
+    the guarantee that this tool cannot write matters more than any one call
+    site remembering to respect it.
+    """
+    if not args:
+        raise NotReadOnly("git-roost refuses an empty gh invocation")
+    cmd = args[0]
+    if cmd not in GH_READ_ONLY:
+        raise NotReadOnly("git-roost refuses non-read-only gh command: %r" % cmd)
+    allowed, max_positional = GH_READ_ONLY[cmd]
+    sub = args[1] if len(args) > 1 else ""
+    if sub not in allowed:
+        raise NotReadOnly(
+            "git-roost refuses %r: only %s are read-only"
+            % (" ".join(args[:2]), ", ".join(sorted(allowed)))
+        )
+    # Flag values must use --flag=value form (as every call site here does),
+    # exactly like git()'s "--porcelain=v2": a space-separated value would
+    # look positional and could push this over the cap for a legitimate call.
+    positional = [a for a in args[2:] if not a.startswith("-")]
+    if len(positional) > max_positional:
+        raise NotReadOnly(
+            "git-roost refuses %r: %d positional argument(s), read-only gh %s "
+            "%s takes at most %d"
+            % (" ".join(args), len(positional), cmd, sub, max_positional)
+        )
+
+
+def gh_call(dirpath, *args):
+    """One read-only `gh` call, cwd-scoped to a tree. None on any failure.
+
+    Same best-effort contract as git(): no `gh` on PATH, no auth, no GitHub
+    remote for this tree, a rate limit, or a slow network are all just "we
+    don't know" for this one tree, never a reason to fail the whole scan. gh
+    has no -C equivalent, so the working directory does the scoping git() gets
+    from -C -- this is why every caller passes a path, same shape as git().
+    """
+    check_gh_read_only(args)
+    if GH_PATH is None:
+        return None
+    try:
+        out = subprocess.run(
+            (GH_PATH,) + tuple(args),
+            cwd=str(dirpath),
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout
+
+
+# The five facts kept per tree. Present in a JSON record only when --github was
+# passed -- see apply_github_facts() -- which keeps the default `--json`
+# contract untouched for every consumer that never asks for GitHub data.
+GITHUB_KEYS = ("pr_number", "pr_state", "pr_draft", "pr_review", "pr_ci")
+
+
+def github_facts(path):
+    """PR + CI facts for one tree's current branch, or None.
+
+    One `gh pr view` call gets everything this tool wants: the PR number,
+    whether it is draft, the review decision, and the full check-run rollup
+    for HEAD, all in one round trip -- run from inside the tree so gh resolves
+    "the PR for this branch" itself, the same way git() relies on -C to scope
+    a call instead of asking the caller to already know the answer.
+
+    None whenever there is no open PR for the branch, no GitHub remote, `gh`
+    is missing or unauthenticated, or the call fails for any other reason --
+    it renders as a blank column, not an error.
+    """
+    out = gh_call(
+        path, "pr", "view",
+        "--json=number,state,isDraft,reviewDecision,statusCheckRollup",
+    )
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+
+    # statusCheckRollup mixes GitHub Actions check-runs (status/conclusion)
+    # with external commit statuses (state instead) -- both need reading, or
+    # a repo whose CI is a status API integration would always show blank.
+    # Any run still in progress makes the whole PR "pending"; any failure
+    # makes it "failure" even if something else already succeeded; otherwise
+    # a rollup that reported anything at all is "success".
+    ci = None
+    checks = data.get("statusCheckRollup") or []
+    if checks:
+        failed = pending = seen = False
+        for chk in checks:
+            status = (chk.get("status") or "").upper()
+            conclusion = (chk.get("conclusion") or chk.get("state") or "").upper()
+            if status and status != "COMPLETED":
+                pending = True
+                continue
+            seen = True
+            if conclusion in ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR"):
+                failed = True
+        if failed:
+            ci = "failure"
+        elif pending:
+            ci = "pending"
+        elif seen:
+            ci = "success"
+
+    return {
+        "pr_number": data.get("number"),
+        "pr_state": (data.get("state") or "").lower() or None,
+        "pr_draft": bool(data.get("isDraft")),
+        "pr_review": data.get("reviewDecision") or None,
+        "pr_ci": ci,
+    }
+
+
+def github_facts_map(states):
+    """{tree path: facts} for every tree, fetched fresh, fanned out like collect().
+
+    Its own ThreadPoolExecutor and its own GH_WORKERS cap -- sharing the git
+    pool would let a slow `gh` call hold a worker a local git scan needed, the
+    exact starvation this tool exists to avoid inflicting on itself.
+    """
+    if not states or GH_PATH is None:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(GH_WORKERS, len(states))) as pool:
+        facts = list(pool.map(lambda s: github_facts(Path(s["path"])), states))
+    return {s["path"]: (f or {}) for s, f in zip(states, facts)}
+
+
+def apply_github_facts(states, facts_map):
+    """Merge PR/CI facts onto states in place, defaulting absent ones to None.
+
+    Always sets all five keys once called, even for a tree facts_map has
+    nothing for (no PR, gh missing, the call failed) -- that is what makes the
+    keys a stable, always-present-when-enabled shape rather than sometimes
+    there and sometimes not depending on what gh happened to return.
+    """
+    for st in states:
+        gh = facts_map.get(st["path"]) or {}
+        st["pr_number"] = gh.get("pr_number")
+        st["pr_state"] = gh.get("pr_state")
+        st["pr_draft"] = gh.get("pr_draft", False)
+        st["pr_review"] = gh.get("pr_review")
+        st["pr_ci"] = gh.get("pr_ci")
+    return states
+
+
+def github_cell(s):
+    """PR column: '#123', '#123+' success, '#123x' failure, '#123~' pending,
+    '#123 draft', or blank when there is no open PR.
+
+    ASCII on purpose, not the checkmark/cross this might otherwise reach for --
+    ascii_safe() exists a few hundred lines up because the Windows console
+    codepage mangles exactly that kind of glyph mid-table, and this column
+    should not need its own escape hatch from the same problem.
+    """
+    n = s.get("pr_number")
+    if not n:
+        return ""
+    if s.get("pr_draft"):
+        return "#%d draft" % n
+    mark = {"success": "+", "failure": "x", "pending": "~"}.get(s.get("pr_ci"), "")
+    return "#%d%s" % (n, mark)
+
+
+# Appended to COLUMNS only when --github is passed -- see render()'s `github`
+# parameter. Kept separate from COLUMNS itself so the default table layout is
+# untouched for the far more common case of nobody asking for network calls.
+GITHUB_COLUMN = ("PR", github_cell)
+
+
 # ------------------------------------------------------------------- watch keys
 
 KEYMAP = (
@@ -831,6 +1156,10 @@ KEYMAP = (
     ("s", "sort: recent / repo / work (within a group, never across)"),
     ("f", "filter: all / uncommitted / mid-operation"),
     ("a", "expand or collapse QUIET"),
+    ("l", "toggle table / commit feed"),
+    ("j", "move the cursor down"),
+    ("k", "move the cursor up"),
+    ("enter", "open a detail view for the highlighted tree"),
     ("q", "quit"),
 )
 
@@ -930,12 +1259,22 @@ def help_lines():
     return out
 
 
-def apply_key(view, key):
+def apply_key(view, key, shown=None):
     """Fold one keypress into the live view. Returns "quit", "help" or None.
 
     Split out of the watch loop so the keymap can be tested without a terminal.
     Every other path in this file is testable headlessly and this one was not,
     which is how a key ends up bound to nothing and nobody notices.
+
+    `shown` is the row list the table currently has on screen (from
+    visible_rows()) -- j/k/enter need it to know how far the cursor can move
+    and which tree "enter" opens. It is None outside watch mode and for keys
+    that do not touch the cursor, so every other call site is unaffected.
+
+    Exiting a detail view is not handled here: the watch loop clears
+    view["detail"] on the next keypress before apply_key is even called,
+    the same way it already handles the help overlay -- one overlay-dismissal
+    path, not two.
     """
     if key in ("q", "Q"):
         return "quit"
@@ -944,25 +1283,50 @@ def apply_key(view, key):
     if key in ("s", "S"):
         view["sort"] = SORT_MODES[
             (SORT_MODES.index(view["sort"]) + 1) % len(SORT_MODES)]
+        view["cursor"] = 0
     elif key in ("f", "F"):
         view["filter"] = FILTER_MODES[
             (FILTER_MODES.index(view["filter"]) + 1) % len(FILTER_MODES)]
+        view["cursor"] = 0
     elif key in ("a", "A"):
         view["quiet"] = not view["quiet"]
+        view["cursor"] = 0
+    elif key in ("l", "L"):
+        view["log"] = not view["log"]
+        view["cursor"] = 0
+    elif key in ("j", "J"):
+        # Sort, filter or the quiet toggle can shrink the shown set out from
+        # under a cursor sitting near the bottom -- clamp every time rather
+        # than trusting the value left over from a wider frame.
+        if shown:
+            last = len(shown) - 1
+            view["cursor"] = min(max(0, view.get("cursor", 0)) + 1, last)
+    elif key in ("k", "K"):
+        if shown:
+            last = len(shown) - 1
+            view["cursor"] = max(0, min(view.get("cursor", 0), last) - 1)
+    elif key in ("\r", "\n", "enter"):
+        if shown:
+            cursor = max(0, min(view.get("cursor", 0), len(shown) - 1))
+            view["cursor"] = cursor
+            view["detail"] = shown[cursor]
     # 'r' -- and any unbound key -- falls through to an immediate redraw, which
     # is what refresh means here: the scan happens on the next line of the loop,
     # not behind a cache.
     return None
 
 
-def status_line(sort_mode, filt, expand_quiet, interval):
+def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table"):
     """The one line that says what view you are looking at.
 
     Without it a filtered table is indistinguishable from a fleet that happens
     to be quiet, which is the same failure the summary line guards against.
+    `view_mode` is "table", "log" or "detail" -- `l` and `enter` change what is
+    on screen independently of sort/filter/quiet, so it needs saying too.
     """
     bits = [
         time.strftime("git-roost  %H:%M:%S"),
+        "view:%s" % view_mode,
         "sort:%s" % sort_mode,
         "filter:%s" % FILTER_LABELS[filt],
         "quiet:%s" % ("shown" if expand_quiet else "collapsed"),
@@ -986,26 +1350,91 @@ def scan(args):
     return states
 
 
-def body(args, width, view=None):
-    """One frame. `view` is the live watch state; None means the flags alone.
+def body(args, width, view=None, changed=None, github_map=None):
+    """One frame plus the states it was built from. `view` is the live watch
+    state; None means the flags alone.
 
-    The one-shot path passes None and renders exactly what 0.1 rendered plus
-    whatever --repo/--filter narrowed the scan to. That is the contract behind
-    `git-roost | less` and `git-roost --json | jq`: keys move the watch view
-    and nothing else.
+    The one-shot path passes None and renders exactly what 0.1 rendered, plus
+    whatever --repo/--sort/--filter narrowed or ordered the scan -- those are
+    static flags, not watch state, so they apply identically to the piped
+    path. That is the contract behind `git-roost | less` and `git-roost --json
+    | jq`: keys move the watch view and nothing else. States come back
+    alongside the lines so --fail-on/--check can inspect the fleet without a
+    second scan.
+
+    `changed` is forwarded to render() for the table view only -- see
+    frame_signature(). The watch loop computes it from frame to frame; the
+    one-shot path never has a previous frame to compare against.
+
+    `github_map` is the watch loop's cache hook: pass a pre-fetched {path:
+    facts} map to skip a fresh `gh` round trip this frame, or leave it None to
+    fetch fresh (which is exactly right for the one-shot path -- it only ever
+    calls this once, so there is no cache to reuse). getattr() guards
+    args.github because the inline Args stubs a couple of tests use predate
+    this flag and do not set it.
     """
     states = scan(args)
+    if getattr(args, "github", False):
+        if github_map is None:
+            github_map = github_facts_map(states)
+        apply_github_facts(states, github_map)
+    show_github = getattr(args, "github", False)
     if args.json:
         filt = view["filter"] if view is not None else args.filter
         if filt != "all":
             states = [s for s in states if passes_filter(s, filt)]
-        return [json.dumps(states, indent=2, sort_keys=True)]
-    if args.log is not None:
-        return render_log(states, args.log, width)
+        return [json.dumps(states, indent=2, sort_keys=True)], states
     if view is None:
-        return render(states, width, expand_quiet=args.all, filt=args.filter)
+        if args.log is not None:
+            return render_log(states, args.log, width), states
+        return render(states, width, expand_quiet=args.all,
+                      sort_mode=args.sort, filt=args.filter,
+                      github=show_github), states
+    return render_view(states, width, view, changed, show_github), states
+
+
+def render_view(states, width, view, changed=None, github=False):
+    """Render one already-scanned watch-mode frame from the live view state.
+
+    Split out of body() so the watch loop can reuse a single scan for both the
+    rendered frame and the cursor's row list, instead of scanning twice a
+    redraw.
+    """
+    if view.get("detail") is not None:
+        target = view["detail"]
+        # Watch mode rescans every interval; show the freshest state for that
+        # tree rather than freezing the frame it was opened on. If the tree
+        # has vanished (worktree removed mid-session), fall back to what was
+        # last known about it rather than crashing.
+        current = next((s for s in states if s["path"] == target["path"]), None)
+        return detail_lines(current or target, width)
+    if view.get("log"):
+        limit = view.get("log_limit") or 25
+        return render_log(states, limit, width)
     return render(states, width, expand_quiet=view["quiet"],
-                  sort_mode=view["sort"], filt=view["filter"])
+                  sort_mode=view["sort"], filt=view["filter"],
+                  changed=changed, github=github)
+
+
+def exit_code(states, fail_on):
+    """0 unless --fail-on names a condition present in the (unfiltered) fleet.
+
+    Checked against the whole fleet, not a --filter view, for the same reason
+    the summary line always says both counts: a hook that asked "is anything
+    stuck" should not get a false "no" because someone also passed --filter
+    dirty for a human to read at the same time.
+    """
+    if not fail_on or fail_on == "none":
+        return 0
+    for st in states:
+        order, _ = bucket(st)
+        if fail_on == "stuck" and order == 0:
+            return 1
+        if fail_on == "diverged" and order <= 1:
+            return 1
+        if fail_on == "dirty" and order <= 2:
+            return 1
+    return 0
 
 
 def main(argv=None):
@@ -1028,20 +1457,37 @@ def main(argv=None):
                     help="commit feed across every repo, newest first (default 25)")
     ap.add_argument("-a", "--all", action="store_true", help="expand the QUIET group")
     ap.add_argument("--root", action="append", metavar="DIR",
-                    help="where to look for repos (repeatable; default ~/GitHub)")
+                    help="where to look for repos (repeatable; default $GIT_ROOST_ROOT or ~/GitHub)")
     ap.add_argument("--depth", type=int, default=DEFAULT_DEPTH, metavar="N",
                     help="how deep to search below each root (default %d)" % DEFAULT_DEPTH)
     ap.add_argument("--repo", action="append", metavar="NAME",
                     help="only repos whose name contains NAME (repeatable, "
                          "case-insensitive)")
+    ap.add_argument("--sort", choices=SORT_MODES, default=SORT_MODES[0],
+                    help="sort within each group (default %s)" % SORT_MODES[0])
     ap.add_argument("--filter", choices=FILTER_MODES, default="all", metavar="MODE",
                     help="show only this view: %s (default all)" % ", ".join(FILTER_MODES))
     ap.add_argument("--check", action="store_true",
                     help="print nothing but a summary and exit 1 if any tree is "
                          "mid-operation, diverged, or has uncommitted work; 0 "
                          "otherwise. For scripts and hooks, not the table.")
+    ap.add_argument("--fail-on", choices=("none", "dirty", "diverged", "stuck"),
+                    default="none", metavar="COND",
+                    help="like --check, but keeps the normal render and only "
+                         "changes the exit code -- pick which of stuck "
+                         "(mid-operation), diverged (also ahead+behind a base) or "
+                         "dirty (also uncommitted work) trips it. Checked against "
+                         "the whole fleet, not --filter. Default none (always 0).")
     ap.add_argument("--json", action="store_true", help="emit records as JSON")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
+    ap.add_argument("--github", action="store_true",
+                    help="add a PR/CI column via `gh` (opt-in: network calls, "
+                         "needs gh on PATH and authenticated; silently omitted "
+                         "otherwise)")
+    ap.add_argument("--github-interval", type=float, default=30.0, metavar="SECS",
+                    help="in watch mode, refresh PR/CI data at most every SECS "
+                         "seconds rather than every redraw (default 30); no "
+                         "effect outside -w or without --github")
     args = ap.parse_args(argv)
 
     # Escape sequences need a real terminal that understands them. This gates
@@ -1077,28 +1523,73 @@ def main(argv=None):
 
     if args.once or not args.watch:
         width = shutil.get_terminal_size((160, 24)).columns
-        print("\n".join(body(args, width)))
-        return 0
+        lines, states = body(args, width)
+        print("\n".join(lines))
+        return exit_code(states, args.fail_on)
 
     # Live view state, separate from args: the flags are the starting position
-    # and the keys move from there. --all seeds the quiet toggle, and --filter
-    # seeds the filter the same way, so `-w --filter dirty` opens filtered and
-    # `f` still cycles from there.
-    view = {"sort": SORT_MODES[0], "filter": args.filter, "quiet": args.all}
+    # and the keys move from there. --all seeds the quiet toggle, --sort/
+    # --filter seed the sort/filter, and --log seeds the table/feed toggle, so
+    # `-a -w` opens expanded and `a` still collapses it, and `--log -w` opens
+    # on the feed and `l` still flips back.
+    view = {
+        "sort": args.sort, "filter": args.filter, "quiet": args.all,
+        "log": args.log is not None, "log_limit": args.log if args.log is not None else 25,
+        "cursor": 0, "detail": None,
+    }
     helping = False
+    last_states = []
+    # Previous frame's (bucket, WORK, DRIFT) per tree path, for the "what
+    # moved" highlight. Empty on the first frame, so nothing is marked changed
+    # before there is anything to compare against.
+    prev_sig = {}
+
+    # GitHub data is cached across redraws and refreshed on its own, longer
+    # interval (--github-interval, default 30s) rather than every redraw
+    # (default 3s). The local git scan is fast and local; `gh` is neither --
+    # it is a network call subject to GitHub's own rate limits, so re-fetching
+    # it every frame would be both slow and a good way to get throttled for no
+    # benefit, since a PR's review state rarely changes inside a 3s window.
+    github_map = {}
+    last_gh_fetch = 0.0
 
     try:
         with Keys() as keys:
             while True:
                 width = shutil.get_terminal_size((160, 24)).columns
-                out = help_lines() if helping else body(args, width, view)
+                states = scan(args)
+                last_states = states
+
+                if args.json:
+                    out = [json.dumps(states, indent=2, sort_keys=True)]
+                    shown = []
+                else:
+                    if args.github:
+                        now = time.time()
+                        due = now - last_gh_fetch >= args.github_interval or not github_map
+                        if due:
+                            github_map = github_facts_map(states)
+                            last_gh_fetch = now
+                        apply_github_facts(states, github_map)
+
+                    cur_sig = {s["path"]: frame_signature(s) for s in states}
+                    changed = {p for p, sig in cur_sig.items()
+                               if p in prev_sig and prev_sig[p] != sig}
+                    prev_sig = cur_sig
+                    out = help_lines() if helping else render_view(
+                        states, width, view, changed, args.github)
+                    shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
+
                 if ansi:
                     sys.stdout.write("\033[H\033[2J")
                 else:
                     # No VT support: a rule beats escape codes printed literally.
                     sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
+                view_mode = "detail" if view.get("detail") is not None else (
+                    "log" if view.get("log") else "table")
                 sys.stdout.write(status_line(
-                    view["sort"], view["filter"], view["quiet"], args.watch) + "\n\n")
+                    view["sort"], view["filter"], view["quiet"], args.watch,
+                    view_mode) + "\n\n")
                 sys.stdout.write("\n".join(out) + "\n")
                 sys.stdout.flush()
 
@@ -1111,13 +1602,19 @@ def main(argv=None):
                 if helping:
                     helping = False
                     continue
-                action = apply_key(view, key)
+                # Detail is its own overlay, dismissed by any key -- same
+                # pattern as help, one step above so apply_key never sees the
+                # keypress that closes it.
+                if view.get("detail") is not None:
+                    view["detail"] = None
+                    continue
+                action = apply_key(view, key, shown=shown)
                 if action == "quit":
                     break
                 helping = action == "help"
     except KeyboardInterrupt:
         pass
-    return 0
+    return exit_code(last_states, args.fail_on)
 
 
 if __name__ == "__main__":

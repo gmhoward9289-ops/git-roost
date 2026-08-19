@@ -22,7 +22,8 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+import unittest.mock
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -627,7 +628,8 @@ class TestWatchKeys(unittest.TestCase):
         # The map is what the `?` overlay prints. A key documented but not wired
         # would look like a broken feature rather than a missing one.
         documented = {k for k, _ in git_roost.KEYMAP}
-        self.assertEqual(documented, {"?", "r", "s", "f", "a", "q"})
+        self.assertEqual(
+            documented, {"?", "r", "s", "f", "a", "l", "j", "k", "enter", "q"})
 
     def test_help_overlay_lists_every_key(self):
         out = "\n".join(git_roost.help_lines())
@@ -726,15 +728,18 @@ class TestWatchKeys(unittest.TestCase):
             all = False
             root = None
             depth = git_roost.DEFAULT_DEPTH
+            sort = git_roost.SORT_MODES[0]
+            filter = git_roost.FILTER_MODES[0]
+            github = False
             repo = None
-            filter = "all"
 
         with tempfile.TemporaryDirectory() as tmp:
             args = Args()
             args.root = [tmp]
             view = {"sort": "repo", "filter": "dirty", "quiet": True}
-            self.assertEqual(git_roost.body(args, 200, view),
-                             ["no git repositories found"])
+            lines, states = git_roost.body(args, 200, view)
+            self.assertEqual(lines, ["no git repositories found"])
+            self.assertEqual(states, [])
 
     def test_body_without_a_view_renders_the_one_shot_table(self):
         # The contract behind `git-roost | less` and `git-roost --json | jq`:
@@ -745,13 +750,211 @@ class TestWatchKeys(unittest.TestCase):
             all = False
             root = None
             depth = git_roost.DEFAULT_DEPTH
+            sort = git_roost.SORT_MODES[0]
+            filter = git_roost.FILTER_MODES[0]
+            github = False
             repo = None
-            filter = "all"
 
         with tempfile.TemporaryDirectory() as tmp:
             args = Args()
             args.root = [tmp]
-            self.assertEqual(git_roost.body(args, 200), ["no git repositories found"])
+            lines, states = git_roost.body(args, 200)
+            self.assertEqual(lines, ["no git repositories found"])
+            self.assertEqual(states, [])
+
+
+class TestCursorAndDetail(unittest.TestCase):
+    """j/k/enter: the row cursor and its detail view.
+
+    apply_key() needs the currently shown rows to keep the cursor sane, since
+    sort/filter/quiet can shrink or reorder the set out from under it between
+    keypresses.
+    """
+
+    def test_j_moves_down_and_stops_at_the_last_row(self):
+        shown = [renderable(repo="a"), renderable(repo="b"), renderable(repo="c")]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        for _ in range(5):  # more presses than rows, on purpose
+            git_roost.apply_key(view, "j", shown=shown)
+        self.assertEqual(view["cursor"], len(shown) - 1)
+
+    def test_k_moves_up_and_stops_at_zero(self):
+        # The bug this guards against: a naive decrement with no floor sends
+        # the cursor negative, which then indexes shown[-1] on `enter` --
+        # silently opening the wrong tree instead of doing nothing.
+        shown = [renderable(repo="a"), renderable(repo="b")]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        git_roost.apply_key(view, "k", shown=shown)
+        self.assertEqual(view["cursor"], 0)
+
+    def test_j_and_k_with_no_shown_rows_does_not_move_or_crash(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        git_roost.apply_key(view, "j", shown=[])
+        git_roost.apply_key(view, "k", shown=None)
+        self.assertEqual(view["cursor"], 0)
+
+    def test_changing_sort_resets_the_cursor(self):
+        # A cursor left at row 4 after a sort that now has only 2 rows on
+        # screen would either be silently clamped somewhere else or, worse,
+        # index past the end. Resetting on any view-shaping key sidesteps
+        # both.
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 3}
+        git_roost.apply_key(view, "s", shown=[renderable()])
+        self.assertEqual(view["cursor"], 0)
+
+    def test_enter_opens_the_row_under_the_cursor(self):
+        shown = [renderable(repo="a"), renderable(repo="b"), renderable(repo="c")]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 1}
+        git_roost.apply_key(view, "enter", shown=shown)
+        self.assertEqual(view["detail"]["repo"], "b")
+
+    def test_enter_with_no_shown_rows_opens_nothing(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        git_roost.apply_key(view, "enter", shown=[])
+        self.assertNotIn("detail", view)
+
+    def test_enter_clamps_a_cursor_left_over_from_a_wider_frame(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 9}
+        shown = [renderable(repo="only")]
+        git_roost.apply_key(view, "\r", shown=shown)
+        self.assertEqual(view["detail"]["repo"], "only")
+
+    @needs_git
+    def test_detail_view_shows_full_stash_list_for_a_tree_with_stashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            (repo / "f.txt").write_text("one\n")
+            run(repo, "add", "f.txt")
+            run(repo, "stash", "push", "-m", "wip one")
+            (repo / "f.txt").write_text("two\n")
+            run(repo, "add", "f.txt")
+            run(repo, "stash", "push", "-m", "wip two")
+
+            st = git_roost.tree_state(repo)
+            out = "\n".join(git_roost.detail_lines(st))
+            self.assertIn("wip one", out)
+            self.assertIn("wip two", out)
+            self.assertNotIn("(none)", out)
+
+    @needs_git
+    def test_detail_view_says_none_for_a_tree_with_no_stashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            st = git_roost.tree_state(repo)
+            out = "\n".join(git_roost.detail_lines(st))
+            self.assertIn("(none)", out)
+
+    @needs_git
+    def test_detail_view_includes_last_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            st = git_roost.tree_state(repo)
+            out = "\n".join(git_roost.detail_lines(st))
+            self.assertIn("initial", out)
+
+    @needs_git
+    def test_detail_view_shows_operation_in_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            (repo / "f.txt").write_text("base\n")
+            run(repo, "add", "f.txt")
+            run(repo, "commit", "-m", "base")
+            run(repo, "checkout", "-b", "side")
+            (repo / "f.txt").write_text("side\n")
+            run(repo, "add", "f.txt")
+            run(repo, "commit", "-m", "side")
+            run(repo, "checkout", "main")
+            (repo / "f.txt").write_text("main\n")
+            run(repo, "add", "f.txt")
+            run(repo, "commit", "-m", "main")
+            subprocess.run(("git", "merge", "side"), cwd=str(repo),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            st = git_roost.tree_state(repo)
+            out = "\n".join(git_roost.detail_lines(st))
+            self.assertIn("merge in progress", out)
+
+
+class TestChangeHighlighting(unittest.TestCase):
+    """Frame-to-frame change marking: what a top-style tool owes a watcher."""
+
+    def test_frame_signature_changes_when_bucket_changes(self):
+        clean = renderable(repo="a", tracked=0)
+        dirty = renderable(repo="a", tracked=3)
+        self.assertNotEqual(git_roost.frame_signature(clean), git_roost.frame_signature(dirty))
+
+    def test_frame_signature_is_stable_for_an_identical_state(self):
+        a = renderable(repo="a", tracked=1, untracked=2, ahead=1, behind=0, base="origin/main")
+        b = renderable(repo="a", tracked=1, untracked=2, ahead=1, behind=0, base="origin/main")
+        self.assertEqual(git_roost.frame_signature(a), git_roost.frame_signature(b))
+
+    def test_frame_signature_ignores_last_ts_alone(self):
+        # LAST ticks every second in watch mode. If the signature included it,
+        # every row would show as "changed" on every redraw, which defeats the
+        # entire point of a change marker.
+        a = renderable(repo="a", last_ts=1000)
+        b = renderable(repo="a", last_ts=2000)
+        self.assertEqual(git_roost.frame_signature(a), git_roost.frame_signature(b))
+
+    def test_render_marks_a_changed_row_and_not_an_unchanged_one(self):
+        # tracked=1 keeps both rows out of the collapsed QUIET group, which
+        # would otherwise fold them into one summary line with no per-row
+        # marker to assert on.
+        unchanged = renderable(repo="a", path="/p/a", tracked=1)
+        row_changed = renderable(repo="b", path="/p/b", tracked=1)
+        rows = [unchanged, row_changed]
+        out = git_roost.render(rows, width=200, changed={"/p/b"})
+        # The marker is a fixed two-char prefix ("* " or "  "); the REPO cell
+        # right after it starts immediately with the repo name. COLOR is off
+        # in the test process (no terminal), so there are no escapes to strip.
+        a_line = next(l for l in out if l[2:].startswith("a"))
+        b_line = next(l for l in out if l[2:].startswith("b"))
+        self.assertTrue(a_line.startswith("  "))
+        self.assertTrue(b_line.startswith("* "))
+
+    def test_render_without_changed_marks_nothing(self):
+        rows = [renderable(repo="a", path="/p/a")]
+        out = "\n".join(git_roost.render(rows, width=200))
+        self.assertNotIn("*", out)
+
+
+class TestLogToggle(unittest.TestCase):
+    """`l`: flip watch mode between the fleet table and the commit feed."""
+
+    def test_l_toggles_log_both_ways(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "log": False, "cursor": 0}
+        git_roost.apply_key(view, "l")
+        self.assertTrue(view["log"])
+        git_roost.apply_key(view, "l")
+        self.assertFalse(view["log"])
+
+    @needs_git
+    def test_render_view_shows_the_feed_when_log_is_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            states = git_roost.collect(git_roost.discover([Path(tmp)]))
+            view = {"sort": "recent", "filter": "all", "quiet": False,
+                    "log": True, "log_limit": 25, "cursor": 0, "detail": None}
+            out = "\n".join(git_roost.render_view(states, 200, view))
+            self.assertIn("initial", out)
+            self.assertIn("AGE", out)  # render_log's header, not render()'s
+
+    @needs_git
+    def test_render_view_shows_the_table_when_log_is_unset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r")
+            states = git_roost.collect(git_roost.discover([Path(tmp)]))
+            view = {"sort": "recent", "filter": "all", "quiet": False,
+                    "log": False, "log_limit": 25, "cursor": 0, "detail": None}
+            out = "\n".join(git_roost.render_view(states, 200, view))
+            self.assertIn("WORK", out)  # render()'s header, not render_log's
+
+    def test_render_view_shows_detail_when_set(self):
+        st = renderable(repo="a", path="/p/a")
+        view = {"sort": "recent", "filter": "all", "quiet": False,
+                "log": False, "log_limit": 25, "cursor": 0, "detail": st}
+        out = "\n".join(git_roost.render_view([st], 200, view))
+        self.assertIn("LAST 5 COMMITS", out)
 
 
 class TestCli(unittest.TestCase):
@@ -803,6 +1006,351 @@ class TestCli(unittest.TestCase):
                 git_roost.main(["--root", tmp, "--json"])
             data = json.loads(buf.getvalue())
             self.assertEqual(set(data[0]), EXPECTED)
+
+    def test_sort_and_filter_flags_reach_the_one_shot_render(self):
+        # SORT_MODES/FILTER_MODES were only ever reachable from watch-mode keys.
+        # These flags are the scriptable path onto the same machinery.
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = git_roost.main(["--root", tmp, "--filter", "dirty"])
+            self.assertEqual(rc, 0)
+            self.assertIn("no tree matches filter: uncommitted", buf.getvalue())
+
+    def test_sort_and_filter_reject_unknown_values(self):
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                git_roost.main(["--sort", "bogus"])
+
+
+class TestExitCode(unittest.TestCase):
+    def _state(self, operation="", ahead=0, behind=0, tracked=0):
+        return {
+            "operation": operation, "ahead": ahead, "behind": behind,
+            "tracked": tracked, "last_ts": None,
+        }
+
+    def test_none_is_always_zero(self):
+        self.assertEqual(git_roost.exit_code([self._state(operation="rebase")], "none"), 0)
+
+    def test_stuck_only_fires_on_mid_operation(self):
+        self.assertEqual(git_roost.exit_code([self._state(ahead=1, behind=1)], "stuck"), 0)
+        self.assertEqual(git_roost.exit_code([self._state(operation="rebase")], "stuck"), 1)
+
+    def test_diverged_fires_on_stuck_or_diverged_but_not_merely_dirty(self):
+        self.assertEqual(git_roost.exit_code([self._state(tracked=3)], "diverged"), 0)
+        self.assertEqual(git_roost.exit_code([self._state(ahead=1, behind=1)], "diverged"), 1)
+        self.assertEqual(git_roost.exit_code([self._state(operation="merge")], "diverged"), 1)
+
+    def test_dirty_fires_on_uncommitted_work_too(self):
+        self.assertEqual(git_roost.exit_code([self._state(tracked=3)], "dirty"), 1)
+        self.assertEqual(git_roost.exit_code([self._state()], "dirty"), 0)
+
+    def test_checked_against_the_whole_fleet_not_a_filtered_view(self):
+        # A hook asking --fail-on stuck must not get a false 0 just because the
+        # caller also passed --filter for a human to read at the same time.
+        fleet = [self._state(), self._state(operation="rebase")]
+        self.assertEqual(git_roost.exit_code(fleet, "stuck"), 1)
+
+
+HAVE_GH = bool(__import__("shutil").which("gh"))
+needs_gh = unittest.skipUnless(HAVE_GH, "gh is not installed")
+
+
+class TestGhReadOnlyGuard(unittest.TestCase):
+    """gh's own read-only wrapper. Same spirit as TestReadOnlyGuard, adapted to
+    gh's shape: writes live on separate subcommands rather than behind flags on
+    a read one, so the allowlist only needs (command, subcommand) plus the same
+    fail-closed positional cap check_read_only uses.
+    """
+
+    def test_write_subcommands_raise(self):
+        for args in [
+            ("pr", "merge"), ("pr", "close"), ("pr", "edit"),
+            ("pr", "ready"), ("pr", "review"), ("pr", "comment"),
+            ("pr", "create"), ("pr", "reopen"),
+        ]:
+            with self.assertRaises(git_roost.NotReadOnly, msg=" ".join(args)):
+                git_roost.check_gh_read_only(args)
+
+    def test_non_pr_commands_raise(self):
+        for args in [("issue", "list"), ("repo", "delete"), ("api", "graphql"),
+                     ("run", "rerun"), ("workflow", "run")]:
+            with self.assertRaises(git_roost.NotReadOnly, msg=" ".join(args)):
+                git_roost.check_gh_read_only(args)
+
+    def test_empty_args_raise(self):
+        with self.assertRaises(git_roost.NotReadOnly):
+            git_roost.check_gh_read_only(())
+
+    def test_safe_forms_are_permitted(self):
+        for args in [
+            ("pr", "view", "--json=number,state"),
+            ("pr", "list", "--json=number"),
+            ("pr", "status"),
+            ("pr", "view"),
+        ]:
+            git_roost.check_gh_read_only(args)  # must not raise
+
+    def test_a_bare_positional_argument_is_refused(self):
+        # The positional cap is a fail-closed backstop, same shape as git's:
+        # a value that should have arrived as --flag=value instead looks like
+        # an unexamined extra argument, and this refuses it rather than
+        # guessing it is still safe.
+        with self.assertRaises(git_roost.NotReadOnly):
+            git_roost.check_gh_read_only(("pr", "view", "some-branch"))
+
+    def test_gh_call_checks_before_touching_the_subprocess(self):
+        # A refused call must never reach subprocess.run, whether or not gh is
+        # even installed on this machine.
+        with self.assertRaises(git_roost.NotReadOnly):
+            git_roost.gh_call("/tmp", "pr", "merge")
+
+
+class FakeCompleted:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+class TestGhCall(unittest.TestCase):
+    """gh_call()'s best-effort contract: never raise, never block the scan."""
+
+    def test_returns_none_when_gh_is_not_on_path(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", None):
+            self.assertIsNone(git_roost.gh_call("/tmp", "pr", "view"))
+
+    def test_returns_none_on_timeout(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost.subprocess, "run",
+                 side_effect=git_roost.subprocess.TimeoutExpired("gh", 8)):
+            self.assertIsNone(git_roost.gh_call("/tmp", "pr", "view"))
+
+    def test_returns_none_on_oserror(self):
+        # gh vanishing between shutil.which() and the call, or a bad cwd.
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost.subprocess, "run", side_effect=OSError("boom")):
+            self.assertIsNone(git_roost.gh_call("/tmp", "pr", "view"))
+
+    def test_returns_none_on_nonzero_exit(self):
+        # No PR for this branch, no GitHub remote, not authenticated -- gh
+        # reports all of these as a plain nonzero exit, not an exception.
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost.subprocess, "run",
+                 return_value=FakeCompleted(returncode=1)):
+            self.assertIsNone(git_roost.gh_call("/tmp", "pr", "view"))
+
+    def test_returns_stdout_on_success(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost.subprocess, "run",
+                 return_value=FakeCompleted(stdout='{"number": 1}')):
+            self.assertEqual(git_roost.gh_call("/tmp", "pr", "view"), '{"number": 1}')
+
+    @needs_gh
+    def test_gh_call_against_a_non_repo_directory_degrades_to_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(git_roost.gh_call(tmp, "pr", "view", "--json=number"))
+
+
+PR_JSON = (
+    '{"number": 42, "state": "OPEN", "isDraft": false, '
+    '"reviewDecision": "APPROVED", "statusCheckRollup": %s}'
+)
+
+
+class TestGithubFacts(unittest.TestCase):
+    """Parsing/rollup logic against canned `gh pr view --json` output, so this
+    does not need a real `gh` or network access to run.
+    """
+
+    def _facts(self, checks_json, gh_stdout=None):
+        stdout = gh_stdout if gh_stdout is not None else PR_JSON % checks_json
+        with unittest.mock.patch.object(git_roost, "gh_call", return_value=stdout):
+            return git_roost.github_facts("/tmp")
+
+    def test_no_pr_is_none(self):
+        with unittest.mock.patch.object(git_roost, "gh_call", return_value=None):
+            self.assertIsNone(git_roost.github_facts("/tmp"))
+
+    def test_invalid_json_is_none(self):
+        with unittest.mock.patch.object(git_roost, "gh_call", return_value="not json"):
+            self.assertIsNone(git_roost.github_facts("/tmp"))
+
+    def test_basic_fields(self):
+        facts = self._facts("[]")
+        self.assertEqual(facts["pr_number"], 42)
+        self.assertEqual(facts["pr_state"], "open")
+        self.assertFalse(facts["pr_draft"])
+        self.assertEqual(facts["pr_review"], "APPROVED")
+        self.assertIsNone(facts["pr_ci"])  # no checks reported at all
+
+    def test_draft_flag(self):
+        stdout = ('{"number": 1, "state": "OPEN", "isDraft": true, '
+                  '"reviewDecision": null, "statusCheckRollup": []}')
+        facts = self._facts(None, gh_stdout=stdout)
+        self.assertTrue(facts["pr_draft"])
+        self.assertIsNone(facts["pr_review"])
+
+    def test_all_checks_succeeded_is_success(self):
+        checks = ('[{"status": "COMPLETED", "conclusion": "SUCCESS"}, '
+                  '{"status": "COMPLETED", "conclusion": "SUCCESS"}]')
+        self.assertEqual(self._facts(checks)["pr_ci"], "success")
+
+    def test_any_failure_wins_over_a_success(self):
+        checks = ('[{"status": "COMPLETED", "conclusion": "SUCCESS"}, '
+                  '{"status": "COMPLETED", "conclusion": "FAILURE"}]')
+        self.assertEqual(self._facts(checks)["pr_ci"], "failure")
+
+    def test_in_progress_check_is_pending(self):
+        checks = '[{"status": "IN_PROGRESS", "conclusion": null}]'
+        self.assertEqual(self._facts(checks)["pr_ci"], "pending")
+
+    def test_pending_does_not_hide_a_failure(self):
+        # A run still queued must not mask a check that already failed.
+        checks = ('[{"status": "IN_PROGRESS", "conclusion": null}, '
+                  '{"status": "COMPLETED", "conclusion": "FAILURE"}]')
+        self.assertEqual(self._facts(checks)["pr_ci"], "failure")
+
+    def test_external_status_context_uses_state_not_conclusion(self):
+        # Commit statuses (as opposed to check-runs) carry "state", not
+        # "status"/"conclusion" -- both shapes appear in the same rollup.
+        checks = '[{"state": "FAILURE"}]'
+        self.assertEqual(self._facts(checks)["pr_ci"], "failure")
+
+
+class TestGithubColumn(unittest.TestCase):
+    def test_no_pr_is_blank(self):
+        self.assertEqual(git_roost.github_cell({"pr_number": None}), "")
+
+    def test_draft(self):
+        cell = git_roost.github_cell({"pr_number": 7, "pr_draft": True})
+        self.assertEqual(cell, "#7 draft")
+
+    def test_success_marker(self):
+        cell = git_roost.github_cell(
+            {"pr_number": 7, "pr_draft": False, "pr_ci": "success"})
+        self.assertEqual(cell, "#7+")
+
+    def test_failure_marker(self):
+        cell = git_roost.github_cell(
+            {"pr_number": 7, "pr_draft": False, "pr_ci": "failure"})
+        self.assertEqual(cell, "#7x")
+
+    def test_pending_marker(self):
+        cell = git_roost.github_cell(
+            {"pr_number": 7, "pr_draft": False, "pr_ci": "pending"})
+        self.assertEqual(cell, "#7~")
+
+    def test_no_ci_data_is_just_the_number(self):
+        cell = git_roost.github_cell(
+            {"pr_number": 7, "pr_draft": False, "pr_ci": None})
+        self.assertEqual(cell, "#7")
+
+    def test_cell_text_is_pure_ascii(self):
+        # See github_cell()'s docstring: this column deliberately avoids the
+        # console-mangling problem ascii_safe() exists for elsewhere.
+        for cell in ("#7 draft", "#7+", "#7x", "#7~", "#7"):
+            self.assertTrue(all(32 <= ord(ch) < 127 for ch in cell))
+
+
+class TestGithubFlagGating(unittest.TestCase):
+    """--github must be opt-in: the column and the JSON keys only appear when
+    it is actually passed, and the tool must not need a real `gh` to prove it.
+    """
+
+    def test_column_absent_by_default(self):
+        rows = [renderable(repo="a", last_ts=1)]
+        out = "\n".join(git_roost.render(rows, width=200, expand_quiet=True))
+        self.assertNotIn("PR", out.split("\n")[0].split())
+
+    def test_column_present_when_requested(self):
+        rows = [renderable(repo="a", last_ts=1, pr_number=None, pr_draft=False,
+                           pr_ci=None)]
+        out = "\n".join(git_roost.render(rows, width=200, expand_quiet=True, github=True))
+        self.assertIn("PR", out.split("\n")[0].split())
+
+    def test_json_keys_absent_without_github_flag(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", None), \
+             tempfile.TemporaryDirectory() as tmp:
+            if HAVE_GIT:
+                make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json"])
+            data = json.loads(buf.getvalue())
+            if data:
+                for key in git_roost.GITHUB_KEYS:
+                    self.assertNotIn(key, data[0])
+
+    @needs_git
+    def test_json_keys_present_and_null_when_gh_is_missing(self):
+        # --github still adds the keys even when gh itself is not on the box --
+        # present-but-null, not present-only-when-gh-succeeds, is what keeps
+        # this a stable shape for a consumer to depend on.
+        with unittest.mock.patch.object(git_roost, "GH_PATH", None), \
+             tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json", "--github"])
+            data = json.loads(buf.getvalue())
+            for key in git_roost.GITHUB_KEYS:
+                self.assertIn(key, data[0])
+            self.assertIsNone(data[0]["pr_number"])
+
+    @needs_git
+    def test_json_keys_reflect_a_fetched_pr(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", "gh"), \
+             unittest.mock.patch.object(
+                 git_roost, "gh_call", return_value=PR_JSON % "[]"), \
+             tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json", "--github"])
+            data = json.loads(buf.getvalue())
+            self.assertEqual(data[0]["pr_number"], 42)
+            self.assertEqual(data[0]["pr_review"], "APPROVED")
+
+    def test_apply_github_facts_defaults_are_stable(self):
+        states = [{"path": "/p/a"}, {"path": "/p/b"}]
+        git_roost.apply_github_facts(states, {"/p/a": {"pr_number": 5}})
+        self.assertEqual(states[0]["pr_number"], 5)
+        self.assertIsNone(states[1]["pr_number"])
+        self.assertFalse(states[1]["pr_draft"])
+
+    def test_github_facts_map_is_empty_without_gh(self):
+        with unittest.mock.patch.object(git_roost, "GH_PATH", None):
+            self.assertEqual(git_roost.github_facts_map([{"path": "/p/a"}]), {})
+
+
+class TestRootEnvVar(unittest.TestCase):
+    def test_git_roost_root_overrides_the_default(self):
+        env = {k: v for k, v in os.environ.items() if k != "GIT_ROOST_ROOT"}
+        env["GIT_ROOST_ROOT"] = str(Path("/tmp/one")) + os.pathsep + str(Path("/tmp/two"))
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import git_roost; "
+             "print([str(p) for p in git_roost.DEFAULT_ROOTS])" % str(ROOT)],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertIn("one", out.stdout)
+        self.assertIn("two", out.stdout)
+
+    def test_default_root_when_unset(self):
+        env = {k: v for k, v in os.environ.items() if k != "GIT_ROOST_ROOT"}
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import git_roost; "
+             "print([str(p) for p in git_roost.DEFAULT_ROOTS])" % str(ROOT)],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertIn("GitHub", out.stdout)
 
     @needs_git
     def test_repo_flag_scopes_to_a_substring_match(self):
