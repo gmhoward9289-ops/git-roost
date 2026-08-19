@@ -23,7 +23,7 @@ jobs:
         python: ["3.9", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
@@ -47,7 +47,7 @@ jobs:
   packaging:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
@@ -94,7 +94,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: shellcheck
         run: shellcheck -S warning packaging/*.sh
@@ -119,3 +119,38 @@ jobs:
             exit 1
           fi
           echo "one guarded git invocation path, as designed"
+
+  semgrep:
+    runs-on: ubuntu-latest
+    # Every code path in git-roost shells out to git, so p/python's subprocess
+    # and shell-injection rules cover exactly this program's shape. The lint job
+    # above proves *that* the read-only wrapper is the only way out to git; it
+    # says nothing about how arguments reach it, and an argument built by string
+    # concatenation would satisfy that grep while still being the bug. p/secrets
+    # is close to free on a repo with no credentials, but it is the cheap half
+    # of the pair and both siblings (roost, leghorn) run both.
+    #
+    # Run as a container rather than an action so the ruleset and the binary
+    # arrive together. Pinned by digest, not by the :latest tag the siblings
+    # use: this repo pins every action to a commit SHA, and a floating tag on
+    # the one job whose whole purpose is supply-chain checking would be the
+    # loudest possible place to make an exception. Digest resolved from
+    # semgrep/semgrep:latest on 2026-08-19; bump it deliberately, and expect new
+    # findings when you do -- that is the point of a ruleset that moves.
+    container:
+      image: semgrep/semgrep@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # --error makes findings fail the build rather than annotate it: a
+      # security job that only warns is a security job nobody reads.
+      # --metrics=off because scan telemetry to a third party is not something
+      # a CI run should opt this repo into by default.
+      #
+      # As of 2026-08-19 this is clean -- 0 findings from 195 rules over every
+      # file in the tree -- so there is no baseline to suppress. If that changes,
+      # annotate the specific line with `# nosemgrep: <rule-id>` and the reason
+      # it is a false positive; never add a blanket ignore file, which hides the
+      # next real finding along with this one.
+      - name: Semgrep
+        run: semgrep scan --config p/python --config p/secrets --error --metrics=off .
