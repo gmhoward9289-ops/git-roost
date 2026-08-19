@@ -12,6 +12,8 @@ name: release
 #   npm       -- also `git-roost`, wrapping the same script via bin/git-roost.js.
 #   Homebrew  -- packaging/git-roost.rb copied into gmhoward9289-ops/homebrew-tap
 #                with a checksum computed from the sdist this run just uploaded.
+#   winget    -- a PR against microsoft/winget-pkgs, opened by wingetcreate
+#                against the Windows portable zip this run built.
 #
 # The .deb is built and attached to the release, so `sudo apt install
 # ./git-roost_<version>_all.deb` works. It is deliberately NOT pushed into a
@@ -41,6 +43,21 @@ jobs:
 
       - name: Build the .deb
         run: packaging/build-deb.sh
+
+      # winget has nothing like npm's postinstall or brew's `depends_on`: a
+      # "zip"/"portable" winget package is just files dropped on disk and
+      # symlinked onto PATH. So the installer it needs is this zip -- the
+      # batch sibling of bin/git-roost.js plus the script itself -- built here
+      # rather than shipped as a separate repo artifact, so it can never drift
+      # from the git_roost.py this run just built everything else from.
+      #
+      # Lives in dist/ alongside the wheel, sdist and .deb so the existing
+      # "Attach to the release" step below picks it up with no extra step, and
+      # the existing download-artifact steps in pypi/homebrew-tap need no
+      # changes -- only the pypi job additionally filters it back out, the same
+      # way it already does for the .deb.
+      - name: Build the Windows portable zip
+        run: packaging/build-windows-zip.sh
 
       # __version__ in git_roost.py is the single source the whole toolchain
       # reads (hatch, build-deb.sh, the CLI). A tag that disagrees with it would
@@ -179,11 +196,11 @@ jobs:
         with:
           name: dist
           path: dist
-      # The build job's artifact carries the .deb as well, and
-      # gh-action-pypi-publish uploads the whole directory -- an unfiltered
+      # The build job's artifact carries the .deb and the Windows zip as well,
+      # and gh-action-pypi-publish uploads the whole directory -- an unfiltered
       # dist/ fails the run on a file PyPI was never going to accept.
-      - name: Drop the .deb -- PyPI takes wheels and sdists only
-        run: rm -f dist/*.deb
+      - name: Drop the .deb and the Windows zip -- PyPI takes wheels and sdists only
+        run: rm -f dist/*.deb dist/*.zip
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
   # Publishes to npm as `git-roost` via trusted publishing (OIDC), the same
@@ -345,6 +362,54 @@ jobs:
           git add Formula/git-roost.rb
           git diff --cached --quiet && echo "nothing changed" || git commit -m "git-roost $GITHUB_REF_NAME"
           git push origin master
+
+  # Publishes to winget by opening a PR against microsoft/winget-pkgs -- a
+  # repo this project does not own, cannot push to directly, and whose review
+  # process is Microsoft's, not this workflow's. The action wraps wingetcreate,
+  # which for an EXISTING PackageIdentifier reads the live manifest already in
+  # winget-pkgs, rewrites only the version/URL/hash, and submits a PR; it
+  # cannot create a brand-new PackageIdentifier from nothing.
+  #
+  # ONE-TIME SETUP this job depends on and cannot do for itself, and that no PR
+  # here can complete because it happens outside this repo entirely:
+  #   1. `winget install wingetcreate` (or download the .exe) on any Windows
+  #      box, then `wingetcreate new` pointed at this release's
+  #      git-roost-<version>-windows.zip, answering its prompts with:
+  #      PackageIdentifier gmhoward9289-ops.git-roost, PortableCommandAlias
+  #      git-roost, License Apache-2.0, ShortDescription matching pyproject.toml.
+  #      That command opens the FIRST PR against microsoft/winget-pkgs by hand,
+  #      from a Windows machine, once -- there is no CI substitute for it.
+  #   2. A fork of microsoft/winget-pkgs under gmhoward9289-ops (wingetcreate
+  #      creates this itself on first submit if it does not exist).
+  #   3. A WINGET_PAT secret on this repo: a classic PAT with the `public_repo`
+  #      scope (fine-grained PATs are not yet sufficient for wingetcreate's
+  #      fork-and-PR flow against a repo this large). Same shape as
+  #      TAP_PUSH_TOKEN -- a credential for writing somewhere GITHUB_TOKEN has
+  #      no reach -- but public_repo rather than a scoped Contents grant,
+  #      because the target is someone else's public repo, not a tap this
+  #      account owns outright.
+  #
+  # Until all three exist, this job fails alone on every tag (no PackageIdentifier
+  # to update yet) while the release, PyPI, npm and the tap still land -- the
+  # same degrade-alone shape as every other channel above.
+  winget:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    steps:
+      # windows-latest, not ubuntu-latest like every sibling job: wingetcreate
+      # itself is a Windows-only tool (it shells out to msiexec/signtool-style
+      # inspection of the installer it is submitting), so the action requires
+      # a Windows runner regardless of what the package being submitted needs.
+      - uses: vedantmgoyal2009/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: gmhoward9289-ops.git-roost
+          # Only the zip is a winget installer; without this the action would
+          # also offer wingetcreate the wheel, sdist and .deb from the same
+          # release and either guess wrong or fail on an installer type it
+          # cannot inspect.
+          installers-regex: '-windows\.zip$'
+          token: ${{ secrets.WINGET_PAT }}
 
   # DELIBERATELY ABSENT: the apt-repo job roost has at this point.
   #

@@ -91,6 +91,26 @@ jobs:
           esac
           /tmp/debx/usr/bin/git-roost --version
 
+      # The winget package's whole runtime contract is this zip: unlike the
+      # .deb, the .whl and the npm tarball, nothing installs a dependency for
+      # it, so a broken zip is a broken install with no error until a user
+      # hits it on Windows. Can't run git-roost.cmd itself here (batch needs
+      # Windows), but the zip's shape -- the right two files, at the version
+      # the tag will claim -- is exactly what a Linux runner can prove.
+      - name: The Windows zip builds and carries the same version
+        run: |
+          set -euo pipefail
+          packaging/build-windows-zip.sh
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' git_roost.py)
+          zip_path="dist/git-roost-${version}-windows.zip"
+          test -f "$zip_path"
+          got=$(unzip -Z1 "$zip_path" | sort)
+          want=$(printf 'git-roost.cmd\ngit_roost.py\n')
+          if [ "$got" != "$want" ]; then
+            echo "::error::$zip_path contains: $(printf '%s' "$got" | tr '\n' ' ')"
+            exit 1
+          fi
+
   lint:
     runs-on: ubuntu-latest
     steps:

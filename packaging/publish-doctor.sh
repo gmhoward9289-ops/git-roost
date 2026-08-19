@@ -55,6 +55,8 @@ OWNER=gmhoward9289-ops
 REPO=$OWNER/git-roost
 DIST=git-roost                  # dist == command == module == repo == formula
 TAP=$OWNER/homebrew-tap
+WINGET_ID=$OWNER.git-roost
+WINGET_PKGS=microsoft/winget-pkgs
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 # Minutes after a release during which a lagging channel is PENDING, not FAIL.
@@ -296,6 +298,29 @@ else
   fi
 fi
 
+# --- winget ------------------------------------------------------------------
+# Unlike every channel above, there is no single URL to ask "what version do
+# you serve" -- winget-pkgs is a manifest tree in a repo this project does not
+# own, and there is no registry API, only the repo's own directory layout:
+# manifests/<first-letter-of-publisher>/<Publisher>/<Package>/<version>/. So
+# this checks for the directory itself via the GitHub API (a GET, same as
+# every other check here) rather than fetching a file whose exact name would
+# have to be guessed.
+winget_prefix=$(printf '%s' "$WINGET_ID" | cut -c1 | tr '[:upper:]' '[:lower:]')
+winget_path="manifests/$winget_prefix/$OWNER/git-roost"
+winget_versions=$(gh api "repos/$WINGET_PKGS/contents/$winget_path" \
+                     --jq '.[].name' 2>/dev/null)
+if [ -z "$winget_versions" ]; then
+  todo winget "no $WINGET_ID in $WINGET_PKGS yet -- run 'wingetcreate new' by hand once (see the winget job's comment in release.yml for the exact fields), then WINGET_PAT takes over for every version after"
+else
+  winget_ver=$(printf '%s\n' "$winget_versions" | sort -V | tail -1)
+  if [ "$winget_ver" = "$VERSION" ]; then
+    pass winget "winget install $WINGET_ID ($winget_ver)"
+  else
+    lagging winget "winget-pkgs has $winget_ver, want $VERSION -- rerun the release's winget job, or check the PR it opened against $WINGET_PKGS"
+  fi
+fi
+
 # --- repo secrets the automation depends on ----------------------------------
 # Listing secrets needs admin, and GITHUB_TOKEN does not have it -- in CI this
 # can only ever report a false negative, which is how leghorn's first scheduled
@@ -305,15 +330,18 @@ fi
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
   skip secret "needs admin to list; run this locally to check secrets"
 else
-  # The siblings loop over a list here. git-roost's list is one entry: nothing
-  # else is wired yet, and naming a secret no workflow reads would be inventing
-  # a chore. Add to it when a publish job that needs a credential lands -- a
-  # PyPI or npm trusted publisher needs none, so this may well stay at one.
+  # PyPI and npm need no secret at all (trusted publishing), so this list is
+  # exactly the credentials whose absence make a publish job fail alone.
   secrets=$(gh secret list --repo "$REPO" 2>/dev/null)
   if printf '%s\n' "$secrets" | grep -q '^TAP_PUSH_TOKEN'; then
     pass secret "TAP_PUSH_TOKEN"
   else
     todo secret "TAP_PUSH_TOKEN not set -- gh secret set TAP_PUSH_TOKEN --repo $REPO (needed once release automation pushes to the tap)"
+  fi
+  if printf '%s\n' "$secrets" | grep -q '^WINGET_PAT'; then
+    pass secret "WINGET_PAT"
+  else
+    todo secret "WINGET_PAT not set -- gh secret set WINGET_PAT --repo $REPO (a classic PAT with public_repo scope; needed once the first manifest exists in $WINGET_PKGS)"
   fi
 fi
 
