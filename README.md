@@ -91,6 +91,7 @@ git-roost --json         # records, for piping somewhere else
 git-roost --root ~/src   # look somewhere other than ~/GitHub (repeatable)
 git-roost --sort work --filter dirty   # the watch-mode sort/filter, one-shot and scriptable
 git-roost --fail-on stuck              # exit 1 if any tree is mid-operation -- a pre-flight gate
+git-roost --github                     # add a PR/CI column, via `gh` (opt-in: network calls)
 ```
 
 Watch mode takes keys:
@@ -150,6 +151,39 @@ work on top of that. Useful as the same kind of stale-tree gate `git-roost`
 itself exists to answer, wired into a pre-agent-fanout hook instead of a human
 reading a table.
 
+### `--github`
+
+Opt-in, not on by default. The local scan is disk-only and fast; PR and CI
+state is a network call to GitHub through the `gh` CLI, with a meaningfully
+different latency and trust profile, so it never runs unless asked.
+
+```bash
+git-roost --github                     # one-shot table with a PR column
+git-roost -w --github                  # watch mode; PR/CI refreshed every 30s
+git-roost -w --github --github-interval 10   # refresh PR/CI more often
+git-roost --json --github              # pr_number/pr_state/pr_draft/pr_review/pr_ci per tree
+```
+
+Each tree's current branch is looked up with a single `gh pr view` call, run
+from inside that tree so `gh` resolves "the PR for this branch" itself. It
+degrades the same way `git()` does: no `gh` on `PATH`, no auth, no GitHub
+remote, no open PR, a rate limit, or a slow network are all just "we don't
+know" for that one tree — a blank `PR` column and, in `--json`, `null` values
+rather than a missing key or a crashed scan. The calls go through `gh_call()`,
+a wrapper as careful as `git()`'s: an allowlist keyed on `gh`'s subcommand
+(`pr view` / `pr list` / `pr status` only — nothing that could merge, close,
+edit, or comment), checked before the subprocess ever runs.
+
+In watch mode, PR/CI data is cached and refreshed on its own interval
+(`--github-interval`, default 30s) rather than on every redraw (default 3s):
+the local git scan is cheap enough to run every frame, but `gh` is a
+rate-limited network call and a PR's review state rarely changes inside a 3s
+window.
+
+`--json` only gains the five `pr_*` keys when `--github` was passed — the
+default JSON shape is unchanged for any consumer that never asks for GitHub
+data.
+
 ## Reading the table
 
 Groups are ordered by what it costs to ignore them, not by how interesting they
@@ -174,6 +208,8 @@ Columns:
   `-` means *unknown*, never *in sync*.
 - **STASH** — stash entries, blank when there are none.
 - **LAST** — age of the last commit.
+- **PR** — only with `--github`. `#123` open, `#123+` CI green, `#123x` CI red,
+  `#123~` CI still running, `#123 draft`, blank when there is no open PR.
 
 ### Finding the baseline
 
@@ -201,10 +237,15 @@ know which is authoritative, and a confident wrong baseline is worse than `-`.
 | `GIT_ROOST_ROOT` | `~/GitHub` | where to look for repos, `os.pathsep`-separated for more than one (same convention as `PATH`) — `--root` overrides it for one call |
 | `GIT_ROOST_TIMEOUT` | `5` | seconds any single git call may take before it is abandoned |
 | `GIT_ROOST_WORKERS` | `12` | how many trees are scanned in parallel |
+| `GIT_ROOST_GH_TIMEOUT` | `8` | seconds any single `gh` call may take before it is abandoned (only with `--github`) |
+| `GIT_ROOST_GH_WORKERS` | `4` | how many `gh` calls run in parallel (only with `--github`; its own, smaller pool so a slow `gh` never starves the git scan) |
 
 No dotfile or config file, deliberately — every setting here is an env var or a
 flag, matching roost, leghorn and legbar. The timeout and worker count are both
-about how hard to push a slow disk rather than about git.
+about how hard to push a slow disk rather than about git. The `GH` pair is
+separate on purpose: `gh` is a network call with its own, longer timeout and
+its own, smaller worker cap, and both are irrelevant unless `--github` is
+passed.
 
 The timeout is a ceiling on one call, not on the scan. A tree behind a stalled
 network mount is dropped rather than allowed to hold the whole table hostage —
