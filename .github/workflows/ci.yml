@@ -91,25 +91,57 @@ jobs:
           esac
           /tmp/debx/usr/bin/git-roost --version
 
-      # The winget package's whole runtime contract is this zip: unlike the
-      # .deb, the .whl and the npm tarball, nothing installs a dependency for
-      # it, so a broken zip is a broken install with no error until a user
-      # hits it on Windows. Can't run git-roost.cmd itself here (batch needs
-      # Windows), but the zip's shape -- the right two files, at the version
-      # the tag will claim -- is exactly what a Linux runner can prove.
-      - name: The Windows zip builds and carries the same version
+  # Separate job on windows-latest, not a step of `packaging` above: the
+  # winget zip's whole point is a real PE executable
+  # (packaging/git-roost-launcher.cs, compiled to git-roost.exe), and
+  # producing one needs Add-Type reaching into .NET Framework, which only
+  # exists on Windows -- the ubuntu-latest `packaging` job has no C# compiler
+  # at all. Unlike the .deb/.whl/npm tarball, nothing installs a dependency
+  # for this zip either, so a build that silently produces a broken exe is a
+  # broken install with no error until a user hits it.
+  packaging-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # MUST be Windows PowerShell (powershell.exe), not PowerShell 7/Core
+      # (pwsh) -- see build-windows-zip.ps1's header comment. windows-latest
+      # runners default `shell: pwsh` on a bare `run:`, so this has to say so
+      # explicitly rather than relying on the runner's default.
+      - name: Build the Windows portable zip
+        shell: powershell
+        run: packaging/build-windows-zip.ps1
+
+      # Building a valid zip and building a zip winget can actually install
+      # are different claims -- this proves the second one by doing exactly
+      # what a portable winget install does: extract, then run the exe
+      # in-place, expecting it to find git_roost.py next to itself and Python
+      # on PATH (setup-python below puts one there).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: The zip contains a real exe that actually runs
+        shell: powershell
         run: |
-          set -euo pipefail
-          packaging/build-windows-zip.sh
-          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' git_roost.py)
-          zip_path="dist/git-roost-${version}-windows.zip"
-          test -f "$zip_path"
-          got=$(unzip -Z1 "$zip_path" | sort)
-          want=$(printf 'git-roost.cmd\ngit_roost.py\n')
-          if [ "$got" != "$want" ]; then
-            echo "::error::$zip_path contains: $(printf '%s' "$got" | tr '\n' ' ')"
-            exit 1
-          fi
+          $version = (Select-String -Path git_roost.py -Pattern '^__version__ = "(.*)"').Matches[0].Groups[1].Value
+          $zipPath = "dist/git-roost-$version-windows.zip"
+          if (-not (Test-Path $zipPath)) { throw "$zipPath was not built" }
+
+          $extractDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid())
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir
+          $entries = Get-ChildItem $extractDir | Select-Object -ExpandProperty Name
+          $want = @("git-roost.exe", "git_roost.py")
+          # Compare-Object, not a sorted-string comparison: PowerShell's
+          # default string sort is culture-aware and orders "_" before "-"
+          # differently than a naive expectation, which briefly made this
+          # check fail on a correct zip.
+          if (@(Compare-Object $entries $want).Count -ne 0) {
+            throw "$zipPath contains: $($entries -join ',') (want: $($want -join ','))"
+          }
+
+          $got = & "$extractDir/git-roost.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "git-roost.exe --version exited $LASTEXITCODE" }
+          if ($got -ne "git-roost $version") { throw "git-roost.exe --version printed '$got', want 'git-roost $version'" }
 
   lint:
     runs-on: ubuntu-latest

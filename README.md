@@ -3,6 +3,7 @@
 [![ci](https://github.com/gmhoward9289-ops/git-roost/actions/workflows/ci.yml/badge.svg)](https://github.com/gmhoward9289-ops/git-roost/actions/workflows/ci.yml)
 [![pypi](https://img.shields.io/pypi/v/git-roost)](https://pypi.org/project/git-roost/)
 [![npm](https://img.shields.io/npm/v/git-roost)](https://www.npmjs.com/package/git-roost)
+[![winget](https://img.shields.io/winget/v/gmhoward9289-ops.git-roost)](https://github.com/microsoft/winget-pkgs/tree/master/manifests/g/gmhoward9289-ops/git-roost)
 [![discussions](https://img.shields.io/github/discussions/gmhoward9289-ops/git-roost)](https://github.com/gmhoward9289-ops/git-roost/discussions)
 [![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
@@ -58,6 +59,7 @@ The distribution, the command, the module and the repo are all the bare
 pipx install git-roost          # or: pip install --user git-roost
 npm install -g git-roost        # if Node is what you have
 brew install gmhoward9289-ops/tap/git-roost
+winget install gmhoward9289-ops.git-roost   # Windows; still needs Python on PATH
 ```
 
 Or just take the file. It is one script with no dependencies, so `curl` and
