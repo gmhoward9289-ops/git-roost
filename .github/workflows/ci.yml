@@ -99,26 +99,53 @@ jobs:
       - name: shellcheck
         run: shellcheck -S warning packaging/*.sh
 
-      # git-roost's core safety claim is that it cannot mutate a repo. That is
-      # enforced by an allowlist in git(), so the allowlist is the thing worth
-      # testing -- see tests/. This job additionally refuses any *new* direct
-      # subprocess call to git that bypasses the wrapper.
-      - name: Every git call goes through the read-only wrapper
+      # git-roost's core safety claim is that it cannot mutate a repo (or a PR,
+      # once --github is in play). That is enforced by an allowlist in git()
+      # and, separately, one in gh_call() -- so the allowlists are the thing
+      # worth testing, see tests/. This job additionally refuses any *new*
+      # direct subprocess call to git or gh that bypasses either wrapper.
+      - name: Every git/gh call goes through a read-only wrapper
         run: |
           set -euo pipefail
-          # One subprocess.run in the file, and it must be the one inside git().
+          # Exactly two subprocess.run in the file: the one inside git(), and
+          # the one inside gh_call(). Not "at least two" -- a third guarded
+          # path is still a new invocation surface this check exists to make
+          # a reviewer look at, not something to wave through silently.
           n=$(grep -c 'subprocess\.run' git_roost.py)
-          if [ "$n" -ne 1 ]; then
-            echo "::error::expected exactly 1 subprocess.run (inside git()), found $n"
+          if [ "$n" -ne 2 ]; then
+            echo "::error::expected exactly 2 subprocess.run calls (git() and gh_call()), found $n"
             grep -n 'subprocess\.run' git_roost.py
             exit 1
           fi
-          # And nothing may shell out to git any other way.
-          if grep -nE 'os\.(system|popen)|subprocess\.(call|check_output|Popen|check_call)' git_roost.py; then
-            echo "::error::git must only be invoked through git(), which enforces READ_ONLY"
+          # Each call site must sit behind its own read-only guard: git()'s
+          # subprocess.run behind check_read_only(args), gh_call()'s behind
+          # check_gh_read_only(args). Grepping the whole file for the guard
+          # names would pass even if a guard were deleted from one function
+          # and left dangling elsewhere, so this greps each function's own
+          # body instead -- a plain /start/,/end/ range won't do, because the
+          # start line itself also matches a bare "^def " end pattern and the
+          # range would close on the same line it opened.
+          extract() {
+            awk -v fn="$1" '
+              $0 ~ "^def " fn "\\(" { infunc=1 }
+              infunc && /^def / && $0 !~ "^def " fn "\\(" { infunc=0 }
+              infunc { print }
+            ' git_roost.py
+          }
+          if ! extract git | grep -q 'check_read_only(args)'; then
+            echo "::error::git()'s subprocess.run is no longer guarded by check_read_only()"
             exit 1
           fi
-          echo "one guarded git invocation path, as designed"
+          if ! extract gh_call | grep -q 'check_gh_read_only(args)'; then
+            echo "::error::gh_call()'s subprocess.run is no longer guarded by check_gh_read_only()"
+            exit 1
+          fi
+          # And nothing may shell out to git or gh any other way.
+          if grep -nE 'os\.(system|popen)|subprocess\.(call|check_output|Popen|check_call)' git_roost.py; then
+            echo "::error::git/gh must only be invoked through git()/gh_call(), which enforce READ_ONLY"
+            exit 1
+          fi
+          echo "two guarded invocation paths (git, gh), as designed"
 
   semgrep:
     runs-on: ubuntu-latest
