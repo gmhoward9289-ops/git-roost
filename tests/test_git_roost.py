@@ -297,6 +297,31 @@ class TestBuckets(unittest.TestCase):
         )
 
 
+class TestNeedsAttention(unittest.TestCase):
+    """The threshold --check gates on: exactly the three costliest groups."""
+
+    def test_the_three_costliest_groups_need_attention(self):
+        now = 1000000.0
+        cases = [
+            state(operation="rebase"),
+            state(ahead=1, behind=2),
+            state(tracked=3),
+        ]
+        for st in cases:
+            self.assertTrue(git_roost.needs_attention(st))
+
+    def test_unpushed_behind_active_and_quiet_do_not(self):
+        now = 1000000.0
+        cases = [
+            state(ahead=2),
+            state(behind=2),
+            state(last_ts=now - 60),
+            state(last_ts=now - 99999),
+        ]
+        for st in cases:
+            self.assertFalse(git_roost.needs_attention(st))
+
+
 class TestDiscover(unittest.TestCase):
     def test_finds_repos_and_prunes_vendored_ones(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -706,6 +731,7 @@ class TestWatchKeys(unittest.TestCase):
             sort = git_roost.SORT_MODES[0]
             filter = git_roost.FILTER_MODES[0]
             github = False
+            repo = None
 
         with tempfile.TemporaryDirectory() as tmp:
             args = Args()
@@ -727,6 +753,7 @@ class TestWatchKeys(unittest.TestCase):
             sort = git_roost.SORT_MODES[0]
             filter = git_roost.FILTER_MODES[0]
             github = False
+            repo = None
 
         with tempfile.TemporaryDirectory() as tmp:
             args = Args()
@@ -1324,6 +1351,89 @@ class TestRootEnvVar(unittest.TestCase):
             env=env, capture_output=True, text=True, check=True,
         )
         self.assertIn("GitHub", out.stdout)
+
+    @needs_git
+    def test_repo_flag_scopes_to_a_substring_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            make_repo(Path(tmp) / "beta")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--repo", "alp", "--json"])
+            data = json.loads(buf.getvalue())
+            self.assertEqual([r["repo"] for r in data], ["alpha"])
+
+    @needs_git
+    def test_repo_flag_is_case_insensitive_and_repeatable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            make_repo(Path(tmp) / "beta")
+            make_repo(Path(tmp) / "gamma")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--repo", "ALPHA", "--repo", "beta", "--json"])
+            data = json.loads(buf.getvalue())
+            self.assertEqual(sorted(r["repo"] for r in data), ["alpha", "beta"])
+
+    @needs_git
+    def test_filter_flag_scopes_json_the_same_as_the_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = make_repo(Path(tmp) / "clean")
+            dirty = make_repo(Path(tmp) / "dirty")
+            (dirty / "scratch.txt").write_text("x\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--filter", "dirty", "--json"])
+            data = json.loads(buf.getvalue())
+            self.assertEqual([r["repo"] for r in data], ["dirty"])
+
+    @needs_git
+    def test_check_exits_zero_on_a_clean_fleet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = git_roost.main(["--root", tmp, "--check"])
+            self.assertEqual(rc, 0)
+            self.assertIn("clean", buf.getvalue())
+
+    @needs_git
+    def test_check_exits_nonzero_when_a_tree_has_uncommitted_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "alpha")
+            # An untracked file alone is not "uncommitted work" -- see
+            # test_untracked_only_is_not_uncommitted -- so modify a tracked one.
+            (repo / "README.md").write_text("changed\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = git_roost.main(["--root", tmp, "--check"])
+            self.assertEqual(rc, 1)
+            self.assertIn("alpha", buf.getvalue())
+
+    @needs_git
+    def test_check_ignores_unpushed_and_behind(self):
+        # UNPUSHED/BEHIND are safe states to start work in -- see
+        # needs_attention(). A repo with no remote at all is permanently
+        # ahead-of-nothing and must not trip the gate.
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = git_roost.main(["--root", tmp, "--check"])
+            self.assertEqual(rc, 0)
+
+    @needs_git
+    def test_check_json_emits_only_offending_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clean = make_repo(Path(tmp) / "clean")
+            dirty = make_repo(Path(tmp) / "dirty")
+            (dirty / "README.md").write_text("changed\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = git_roost.main(["--root", tmp, "--check", "--json"])
+            self.assertEqual(rc, 1)
+            data = json.loads(buf.getvalue())
+            self.assertEqual([r["repo"] for r in data], ["dirty"])
 
     @needs_git
     def test_log_feed_does_not_repeat_a_commit_per_worktree(self):

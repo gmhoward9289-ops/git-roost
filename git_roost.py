@@ -16,6 +16,8 @@ uncommitted work nobody has looked at, who is stuck mid-rebase.
     git-roost --log          # commit feed across every repo, newest first
     git-roost --all          # expand the QUIET group
     git-roost --json         # records, for piping somewhere else
+    git-roost --repo wings --filter dirty   # scope to one repo, one view
+    git-roost --check        # exit 1 if anything needs a human first; for hooks
     git-roost --github       # add a PR/CI column, via `gh` (opt-in, network)
 
 Watch mode takes keys -- `?` for the map, `r` refresh, `s` sort, `f` filter, `a`
@@ -78,7 +80,7 @@ except ImportError:
 # Three components, not two: release-please parses strict semver and throws
 # on "0.1", and npm rejects it outright. The historical v0.1 tag stands.
 # x-release-please-start-version
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 # x-release-please-end
 
 HOME = Path.home()
@@ -656,6 +658,19 @@ def passes_filter(st, filt):
     if filt == "stuck":
         return bool(st["operation"])
     return True
+
+
+# The three groups where a human (or an agent about to start work) needs to
+# look before touching the tree: stuck mid-operation, diverged from its base,
+# or carrying uncommitted work. UNPUSHED/BEHIND/ACTIVE/QUIET are all states a
+# fresh session can safely start in -- they cost nothing to walk into, which
+# is exactly the line `--check` exists to draw for scripts and hooks.
+CHECK_THRESHOLD = 2
+
+
+def needs_attention(st):
+    order, _ = bucket(st)
+    return order <= CHECK_THRESHOLD
 
 
 # -------------------------------------------------------------------- render
@@ -1324,7 +1339,15 @@ def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table"):
 
 def scan(args):
     roots = [Path(r).expanduser() for r in args.root] if args.root else list(DEFAULT_ROOTS)
-    return collect(discover(roots, args.depth))
+    states = collect(discover(roots, args.depth))
+    if args.repo:
+        # A substring match, not exact: "--repo roost" finding both roost and
+        # git-roost is a feature here, not ambiguity -- there is no id to match
+        # exactly against, and the fleet is small enough that a loose match
+        # costs nothing to skim past.
+        needles = [r.lower() for r in args.repo]
+        states = [s for s in states if any(n in s["repo"].lower() for n in needles)]
+    return states
 
 
 def body(args, width, view=None, changed=None, github_map=None):
@@ -1332,11 +1355,12 @@ def body(args, width, view=None, changed=None, github_map=None):
     state; None means the flags alone.
 
     The one-shot path passes None and renders exactly what 0.1 rendered, plus
-    whatever --sort/--filter were given -- those are static flags, not watch
-    state, so they apply identically to the piped path. That is the contract
-    behind `git-roost | less` and `git-roost --json | jq`: keys move the watch
-    view and nothing else. States come back alongside the lines so --fail-on
-    can inspect the fleet without a second scan.
+    whatever --repo/--sort/--filter narrowed or ordered the scan -- those are
+    static flags, not watch state, so they apply identically to the piped
+    path. That is the contract behind `git-roost | less` and `git-roost --json
+    | jq`: keys move the watch view and nothing else. States come back
+    alongside the lines so --fail-on/--check can inspect the fleet without a
+    second scan.
 
     `changed` is forwarded to render() for the table view only -- see
     frame_signature(). The watch loop computes it from frame to frame; the
@@ -1356,6 +1380,9 @@ def body(args, width, view=None, changed=None, github_map=None):
         apply_github_facts(states, github_map)
     show_github = getattr(args, "github", False)
     if args.json:
+        filt = view["filter"] if view is not None else args.filter
+        if filt != "all":
+            states = [s for s in states if passes_filter(s, filt)]
         return [json.dumps(states, indent=2, sort_keys=True)], states
     if view is None:
         if args.log is not None:
@@ -1433,15 +1460,23 @@ def main(argv=None):
                     help="where to look for repos (repeatable; default $GIT_ROOST_ROOT or ~/GitHub)")
     ap.add_argument("--depth", type=int, default=DEFAULT_DEPTH, metavar="N",
                     help="how deep to search below each root (default %d)" % DEFAULT_DEPTH)
+    ap.add_argument("--repo", action="append", metavar="NAME",
+                    help="only repos whose name contains NAME (repeatable, "
+                         "case-insensitive)")
     ap.add_argument("--sort", choices=SORT_MODES, default=SORT_MODES[0],
                     help="sort within each group (default %s)" % SORT_MODES[0])
-    ap.add_argument("--filter", choices=FILTER_MODES, default=FILTER_MODES[0],
-                    help="subtractive view of the table (default %s)" % FILTER_MODES[0])
+    ap.add_argument("--filter", choices=FILTER_MODES, default="all", metavar="MODE",
+                    help="show only this view: %s (default all)" % ", ".join(FILTER_MODES))
+    ap.add_argument("--check", action="store_true",
+                    help="print nothing but a summary and exit 1 if any tree is "
+                         "mid-operation, diverged, or has uncommitted work; 0 "
+                         "otherwise. For scripts and hooks, not the table.")
     ap.add_argument("--fail-on", choices=("none", "dirty", "diverged", "stuck"),
                     default="none", metavar="COND",
-                    help="exit 1 if the fleet has a tree matching COND: stuck "
-                         "(mid-operation), diverged (mid-operation or ahead+behind "
-                         "a base), dirty (also uncommitted work). Checked against "
+                    help="like --check, but keeps the normal render and only "
+                         "changes the exit code -- pick which of stuck "
+                         "(mid-operation), diverged (also ahead+behind a base) or "
+                         "dirty (also uncommitted work) trips it. Checked against "
                          "the whole fleet, not --filter. Default none (always 0).")
     ap.add_argument("--json", action="store_true", help="emit records as JSON")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
@@ -1468,6 +1503,23 @@ def main(argv=None):
     COLOR = ansi and not args.no_color and not os.environ.get("NO_COLOR")
     if args.json:
         COLOR = False
+
+    if args.check:
+        # A scripted gate, not a view of the table: watch mode and --filter
+        # don't apply, because the question is binary and the exit code is the
+        # answer. --repo/--root still scope the scan -- a hook checking one
+        # tree before dispatching an agent into it should not have to reason
+        # about the whole fleet.
+        states = scan(args)
+        offenders = [s for s in states if needs_attention(s)]
+        if args.json:
+            print(json.dumps(offenders, indent=2, sort_keys=True))
+        elif not offenders:
+            print("clean: no tree is mid-operation, diverged, or has uncommitted work")
+        else:
+            width = shutil.get_terminal_size((160, 24)).columns
+            print("\n".join(render(offenders, width, filt="all")))
+        return 1 if offenders else 0
 
     if args.once or not args.watch:
         width = shutil.get_terminal_size((160, 24)).columns

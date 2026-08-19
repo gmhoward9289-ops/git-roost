@@ -89,8 +89,9 @@ git-roost --log          # commit feed across every repo, newest first
 git-roost --all          # expand the QUIET group
 git-roost --json         # records, for piping somewhere else
 git-roost --root ~/src   # look somewhere other than ~/GitHub (repeatable)
-git-roost --sort work --filter dirty   # the watch-mode sort/filter, one-shot and scriptable
-git-roost --fail-on stuck              # exit 1 if any tree is mid-operation -- a pre-flight gate
+git-roost --repo wings --sort work --filter dirty   # scope, sort and filter together
+git-roost --check                      # no table -- exit 1 if any tree needs a human first
+git-roost --fail-on stuck              # like --check, but keeps the normal table
 git-roost --github                     # add a PR/CI column, via `gh` (opt-in: network calls)
 ```
 
@@ -132,24 +133,42 @@ other, which is a strange thing for a tool named after `top`. Now a row whose
 group, `WORK` or `DRIFT` changed since the last redraw is marked with a
 leading `*`, so watching quietly still tells you when something moved.
 
+`--repo NAME` (repeatable, case-insensitive substring), `--sort` and `--filter`
+put the `f`/`s` keys' view on the command line, so `--json` and one-shot
+renders can be scoped without a terminal — `git-roost --repo wings --filter
+dirty --json` is one repo's uncommitted trees, nothing else. Both also seed
+`-w`'s starting view, so `-w --sort work --filter dirty` opens watch mode
+already positioned there and the keys still cycle from it.
+
 Keys need a terminal. Piped, redirected, or on a box with neither `termios` nor
 `msvcrt`, watch mode degrades to the plain timer redraw rather than failing, and
 the default one-shot render touches no terminal settings at all — which is what
 keeps `git-roost | less` and `git-roost --json | jq` safe.
 
-`--sort` and `--filter` are the same machinery the `s`/`f` keys cycle through,
-reachable without a terminal at all — `--filter stuck --json` is the scriptable
-form of "is anything stuck," and `-w --sort work --filter dirty` opens watch
-mode already positioned there instead of requiring a few keypresses first.
+Two exit-code flags, for two different hook shapes:
 
-`--fail-on {stuck,diverged,dirty}` turns the exit code into a pre-flight gate:
-nonzero when the *whole fleet* (never the `--filter` view — a hook asking "is
-anything stuck" should not get a false 0 just because a human also filtered the
-table they're looking at) has a tree matching the condition. `stuck` is
-mid-operation only; `diverged` adds ahead-and-behind; `dirty` adds uncommitted
-work on top of that. Useful as the same kind of stale-tree gate `git-roost`
-itself exists to answer, wired into a pre-agent-fanout hook instead of a human
-reading a table.
+- **`--check`** is a different shape entirely from the table: no `--filter`,
+  just pass/fail. `0` means every tree is at worst `UNPUSHED` or `BEHIND`; `1`
+  means at least one is `MID-OPERATION`, `DIVERGED`, or has `UNCOMMITTED` work
+  — and those offending trees print (or `--json` them), so the caller knows
+  which, without reading a full table. `--root`/`--repo` still scope the scan.
+
+  ```bash
+  git-roost --repo counting-chicken-wings --check || echo "not clean, look first"
+  ```
+
+- **`--fail-on {stuck,diverged,dirty}`** is `--check` with the threshold made
+  a choice, and without replacing the table: it prints the normal render (or
+  the normal `--json`) and only changes the exit code, checked against the
+  *whole fleet* (never the `--filter` view — a hook asking "is anything
+  stuck" should not get a false 0 just because a human also filtered the
+  table they're looking at). `stuck` is mid-operation only; `diverged` adds
+  ahead-and-behind; `dirty` (equivalent to `--check`'s fixed threshold) adds
+  uncommitted work on top of that.
+
+  ```bash
+  git-roost -w --fail-on stuck   # a human's normal view, that also exits 1
+  ```
 
 ### `--github`
 
