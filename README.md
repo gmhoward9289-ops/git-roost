@@ -3,6 +3,7 @@
 [![ci](https://github.com/gmhoward9289-ops/git-roost/actions/workflows/ci.yml/badge.svg)](https://github.com/gmhoward9289-ops/git-roost/actions/workflows/ci.yml)
 [![pypi](https://img.shields.io/pypi/v/git-roost)](https://pypi.org/project/git-roost/)
 [![npm](https://img.shields.io/npm/v/git-roost)](https://www.npmjs.com/package/git-roost)
+[![discussions](https://img.shields.io/github/discussions/gmhoward9289-ops/git-roost)](https://github.com/gmhoward9289-ops/git-roost/discussions)
 [![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 `top` for git — every repo and worktree on the box, in one table, most
@@ -46,6 +47,9 @@ QUIET (8)  blog/chicken-fest . copilot-money-mcp/(primary) . repo-security-ci/(p
 ```
 
 ## Install
+
+Questions, ideas, or your own fleet's screenshot go in
+[Discussions](https://github.com/gmhoward9289-ops/git-roost/discussions) — bugs go in Issues.
 
 The distribution, the command, the module and the repo are all the bare
 `git-roost` — pick whichever channel is already on the box.
