@@ -1,0 +1,6 @@
+# A CR in the shebang makes the script unrunnable on Linux/macOS with a
+# baffling "env: bash\r: No such file or directory" (or python3\r). Force LF
+# everywhere -- demo/bin/git-roost hit exactly this checked out from Windows
+# and run under WSL.
+* text=auto eol=lf
+*.py text eol=lf

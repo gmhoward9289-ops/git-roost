@@ -15,6 +15,15 @@ and only one of those two can be wrong.
 
 One file, no dependencies, Python 3.9+, macOS/Linux/Windows.
 
+![git-roost's table re-sorting as a synthetic fleet drifts, goes uncommitted, and gets pushed](demo/git-roost-demo.gif)
+
+The short ambient loop below is the same program, watching quietly:
+
+![git-roost's watch mode, idling until a tree goes dirty and climbs out of QUIET](demo/git-roost-loop.gif)
+
+Recorded against a synthetic fixture, not a real machine — see
+[`demo/`](demo/) for how. Text fallback, same shape:
+
 ```
   REPO                    TREE                      BRANCH                       WORK   DRIFT  STASH  LAST  SUBJECT
 MID-OPERATION
