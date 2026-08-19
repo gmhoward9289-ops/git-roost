@@ -16,6 +16,8 @@ uncommitted work nobody has looked at, who is stuck mid-rebase.
     git-roost --log          # commit feed across every repo, newest first
     git-roost --all          # expand the QUIET group
     git-roost --json         # records, for piping somewhere else
+    git-roost --repo wings --filter dirty   # scope to one repo, one view
+    git-roost --check        # exit 1 if anything needs a human first; for hooks
 
 Watch mode takes keys -- `?` for the map, `r` refresh, `s` sort, `f` filter, `a`
 quiet, `q` quit. The default one-shot render takes none and touches no terminal
@@ -630,6 +632,19 @@ def passes_filter(st, filt):
     return True
 
 
+# The three groups where a human (or an agent about to start work) needs to
+# look before touching the tree: stuck mid-operation, diverged from its base,
+# or carrying uncommitted work. UNPUSHED/BEHIND/ACTIVE/QUIET are all states a
+# fresh session can safely start in -- they cost nothing to walk into, which
+# is exactly the line `--check` exists to draw for scripts and hooks.
+CHECK_THRESHOLD = 2
+
+
+def needs_attention(st):
+    order, _ = bucket(st)
+    return order <= CHECK_THRESHOLD
+
+
 # -------------------------------------------------------------------- render
 
 COLUMNS = (
@@ -960,23 +975,35 @@ def status_line(sort_mode, filt, expand_quiet, interval):
 
 def scan(args):
     roots = [Path(r).expanduser() for r in args.root] if args.root else list(DEFAULT_ROOTS)
-    return collect(discover(roots, args.depth))
+    states = collect(discover(roots, args.depth))
+    if args.repo:
+        # A substring match, not exact: "--repo roost" finding both roost and
+        # git-roost is a feature here, not ambiguity -- there is no id to match
+        # exactly against, and the fleet is small enough that a loose match
+        # costs nothing to skim past.
+        needles = [r.lower() for r in args.repo]
+        states = [s for s in states if any(n in s["repo"].lower() for n in needles)]
+    return states
 
 
 def body(args, width, view=None):
     """One frame. `view` is the live watch state; None means the flags alone.
 
-    The one-shot path passes None and renders exactly what 0.1 rendered. That is
-    the contract behind `git-roost | less` and `git-roost --json | jq`: keys move
-    the watch view and nothing else.
+    The one-shot path passes None and renders exactly what 0.1 rendered plus
+    whatever --repo/--filter narrowed the scan to. That is the contract behind
+    `git-roost | less` and `git-roost --json | jq`: keys move the watch view
+    and nothing else.
     """
     states = scan(args)
     if args.json:
+        filt = view["filter"] if view is not None else args.filter
+        if filt != "all":
+            states = [s for s in states if passes_filter(s, filt)]
         return [json.dumps(states, indent=2, sort_keys=True)]
     if args.log is not None:
         return render_log(states, args.log, width)
     if view is None:
-        return render(states, width, expand_quiet=args.all)
+        return render(states, width, expand_quiet=args.all, filt=args.filter)
     return render(states, width, expand_quiet=view["quiet"],
                   sort_mode=view["sort"], filt=view["filter"])
 
@@ -1004,6 +1031,15 @@ def main(argv=None):
                     help="where to look for repos (repeatable; default ~/GitHub)")
     ap.add_argument("--depth", type=int, default=DEFAULT_DEPTH, metavar="N",
                     help="how deep to search below each root (default %d)" % DEFAULT_DEPTH)
+    ap.add_argument("--repo", action="append", metavar="NAME",
+                    help="only repos whose name contains NAME (repeatable, "
+                         "case-insensitive)")
+    ap.add_argument("--filter", choices=FILTER_MODES, default="all", metavar="MODE",
+                    help="show only this view: %s (default all)" % ", ".join(FILTER_MODES))
+    ap.add_argument("--check", action="store_true",
+                    help="print nothing but a summary and exit 1 if any tree is "
+                         "mid-operation, diverged, or has uncommitted work; 0 "
+                         "otherwise. For scripts and hooks, not the table.")
     ap.add_argument("--json", action="store_true", help="emit records as JSON")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
     args = ap.parse_args(argv)
@@ -1022,15 +1058,33 @@ def main(argv=None):
     if args.json:
         COLOR = False
 
+    if args.check:
+        # A scripted gate, not a view of the table: watch mode and --filter
+        # don't apply, because the question is binary and the exit code is the
+        # answer. --repo/--root still scope the scan -- a hook checking one
+        # tree before dispatching an agent into it should not have to reason
+        # about the whole fleet.
+        states = scan(args)
+        offenders = [s for s in states if needs_attention(s)]
+        if args.json:
+            print(json.dumps(offenders, indent=2, sort_keys=True))
+        elif not offenders:
+            print("clean: no tree is mid-operation, diverged, or has uncommitted work")
+        else:
+            width = shutil.get_terminal_size((160, 24)).columns
+            print("\n".join(render(offenders, width, filt="all")))
+        return 1 if offenders else 0
+
     if args.once or not args.watch:
         width = shutil.get_terminal_size((160, 24)).columns
         print("\n".join(body(args, width)))
         return 0
 
     # Live view state, separate from args: the flags are the starting position
-    # and the keys move from there. --all seeds the quiet toggle, so `-a -w`
-    # opens expanded and `a` still collapses it.
-    view = {"sort": SORT_MODES[0], "filter": FILTER_MODES[0], "quiet": args.all}
+    # and the keys move from there. --all seeds the quiet toggle, and --filter
+    # seeds the filter the same way, so `-w --filter dirty` opens filtered and
+    # `f` still cycles from there.
+    view = {"sort": SORT_MODES[0], "filter": args.filter, "quiet": args.all}
     helping = False
 
     try:

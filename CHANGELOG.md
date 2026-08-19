@@ -31,6 +31,14 @@ section below was written by hand, before that was true.
 
 - Homebrew formula for v0.1, in
   [gmhoward9289-ops/tap](https://github.com/gmhoward9289-ops/homebrew-tap).
+- **`--repo NAME`** and **`--filter {all,dirty,stuck}`** put the watch-mode `f`
+  key's view on the command line, so a one-shot render or `--json` can be
+  scoped to one repo and one view without a terminal.
+- **`--check`** — a scriptable gate, not a table. Exits `1` if any tree is
+  `MID-OPERATION`, `DIVERGED`, or has uncommitted work, `0` otherwise, printing
+  (or `--json`-ing) only the offending trees. For hooks that need to know
+  whether a tree is safe to start work in before an agent touches it, rather
+  than a person reading a screen.
 
 ## [0.1] - 2026-07-31
 
