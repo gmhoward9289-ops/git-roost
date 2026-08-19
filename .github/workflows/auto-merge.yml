@@ -11,6 +11,14 @@ name: Auto-merge owner PRs
 #
 # Bot-authored PRs (release-please, dependabot) deliberately do not match
 # either. Cutting a release stays a decision someone makes on purpose.
+#
+# Merging with GITHUB_TOKEN is also why a squash merged here never refreshes
+# release-please's PR: GitHub refuses to trigger workflows from events created
+# with that token, so the push this job produces on main is invisible to
+# release-please.yml's `on: push`. GIT_ROOST_RELEASE_PLEASE -- the same
+# fine-grained PAT release-please.yml already falls back to -- makes the merge
+# a push from a real actor instead, so it fires like any other push once the
+# secret exists. See issue #17.
 
 on:
   pull_request:
@@ -29,7 +37,7 @@ jobs:
     steps:
       - name: Enable auto-merge
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GIT_ROOST_RELEASE_PLEASE || secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         # The fallback covers repos with no required status checks: GitHub
         # refuses to *queue* an auto-merge on a PR that nothing is blocking,
