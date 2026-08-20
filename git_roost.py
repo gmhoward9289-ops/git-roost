@@ -1543,7 +1543,7 @@ def oneshot_scan_progress(done, total, spin_i):
     until the collect finishes, then restores the same wording with a newline
     so the table that follows is what people already expect.
     """
-    if done >= total:
+    if done <= 0 or done >= total:
         msg = "scanning %d tree(s)..." % total
     else:
         msg = "scanning %d/%d tree(s)... %s" % (done, total, SPIN[spin_i % 4])
@@ -1562,7 +1562,10 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
         out = clip_to_height(help_lines(), body_h, 0)
         shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
     elif not states:
-        out = clip_to_height(empty_result_lines(args), body_h, 0)
+        if loading:
+            out = clip_to_height([loading], body_h, 0)
+        else:
+            out = clip_to_height(empty_result_lines(args), body_h, 0)
         shown = []
     else:
         out = render_view(states, width, view, changed,
@@ -1849,16 +1852,37 @@ def main(argv=None):
             sys.stdout.write("\033[?1049h\033[?25l")
             sys.stdout.flush()
         with Keys() as keys:
+            shown = []
             while True:
                 size = shutil.get_terminal_size((160, 24))
                 width = size.columns
                 height = max(8, size.lines)
-                states = scan(args)
+                spin_n = [0]
+                last_paint = [0.0]
+
+                def on_progress(done, total, partial):
+                    now = time.time()
+                    if done < total and now - last_paint[0] < 0.12:
+                        return
+                    last_paint[0] = now
+                    loading = "scanning %d/%d %s" % (
+                        done, total, SPIN[spin_n[0] % 4])
+                    spin_n[0] += 1
+                    # First scan: paint whatever has finished. Later
+                    # refreshes keep the last complete table and only
+                    # spin the status line, so j/k don't jump every tick.
+                    live = partial if not last_states else last_states
+                    draw_watch_frame(
+                        ansi, width, height, view, args, helping, live,
+                        {}, loading=loading)
+
+                states = scan(
+                    args, on_progress=None if args.json else on_progress)
                 last_states = states
 
                 if args.json:
-                    out = [json.dumps(states, indent=2, sort_keys=True)]
-                    shown = []
+                    shown = draw_watch_frame(
+                        ansi, width, height, view, args, helping, states, {})
                 else:
                     if args.github:
                         now = time.time()
@@ -1872,29 +1896,9 @@ def main(argv=None):
                     changed = {p for p, sig in cur_sig.items()
                                if p in prev_sig and prev_sig[p] != sig}
                     prev_sig = cur_sig
-                    body_h = max(4, height - 1)
-                    if helping:
-                        out = clip_to_height(help_lines(), body_h, 0)
-                    elif not states:
-                        out = clip_to_height(empty_result_lines(args), body_h, 0)
-                    else:
-                        out = render_view(
-                            states, width, view, changed, args.github,
-                            height=body_h)
-                    shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
-
-                if ansi:
-                    sys.stdout.write("\033[H\033[2J")
-                else:
-                    # No VT support: a rule beats escape codes printed literally.
-                    sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
-                view_mode = "detail" if view.get("detail") is not None else (
-                    "log" if view.get("log") else "table")
-                sys.stdout.write(status_line(
-                    view["sort"], view["filter"], view["quiet"], args.watch,
-                    view_mode) + "\n")
-                sys.stdout.write("\n".join(out) + "\n")
-                sys.stdout.flush()
+                    shown = draw_watch_frame(
+                        ansi, width, height, view, args, helping, states,
+                        changed)
 
                 # The help overlay waits for a key rather than timing out under
                 # the reader. A keymap that vanished after 3s would be gone at
