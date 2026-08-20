@@ -344,9 +344,10 @@ Measured on 27 trees across 11 repos: **~0.68s** per redraw, comfortably inside
 the default 3s watch interval. A Windows box with ~85 trees is closer to
 **~8s** for a one-shot: finding the trees is cheap, each one is several
 `git.exe` spawns. A bare run prints `scanning N tree(s)...` on stderr and
-ticks `k/N` plus a spinner until the table is ready. Watch mode paints
-rows as they finish on the first scan, and on later refreshes keeps the last
-table while the status line spins. Tunable with `GIT_ROOST_WORKERS` and
+ticks `k/N` plus a spinner until the table is ready. Watch mode fills a
+fixed slot per tree (discover order) so the screen does not flash or
+regroup mid-scan; later refreshes keep the last grouped table and only
+spin the status line. Tunable with `GIT_ROOST_WORKERS` and
 `GIT_ROOST_TIMEOUT`.
 
 ## The family

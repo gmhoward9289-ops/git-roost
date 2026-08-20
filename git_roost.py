@@ -592,12 +592,13 @@ def collect(paths, on_progress=None):
     with ThreadPoolExecutor(max_workers=min(GIT_WORKERS, len(paths))) as pool:
         fmap = {pool.submit(tree_state, p): i for i, p in enumerate(paths)}
         finished = 0
+        if on_progress:
+            on_progress(0, len(paths), ordered)
         for fut in as_completed(fmap):
             ordered[fmap[fut]] = fut.result()
             finished += 1
             if on_progress:
-                ready = [s for s in ordered if s]
-                on_progress(finished, len(paths), ready)
+                on_progress(finished, len(paths), ordered)
     return [s for s in ordered if s]
 
 
@@ -877,6 +878,52 @@ def clip_to_height(lines, height, focus=0):
     if below and window:
         window[-1] = c("  ... %d more below  (j)" % below, DIM)
     return [header] + window + [footer]
+
+
+def write_tty_frame(width, height, lines):
+    """Overwrite the visible screen in place.
+
+    `\033[2J` (erase display) is what made watch mode flash: the whole
+    buffer went black between paints. Home the cursor, write each row, and
+    clear to end-of-line so a shorter replacement does not leave junk. No
+    newlines -- a newline on the last row would scroll.
+    """
+    rows = list(lines[:height])
+    while len(rows) < height:
+        rows.append("")
+    sys.stdout.write("\033[H")
+    for i, row in enumerate(rows):
+        sys.stdout.write("\033[%d;1H%s\033[K" % (i + 1, row))
+    sys.stdout.flush()
+
+
+def render_pending(paths, ordered, width=160, height=None):
+    """Stable loading table: one slot per discovered path, never regrouped.
+
+    The grouped render jumps as trees finish (a row appears under UNCOMMITTED,
+    then the next paint shuffles it). This keeps discover order so cells fill
+    in place until collect() is done.
+    """
+    lines = [c("  REPO                      TREE                      WORK   DRIFT  SUBJECT", BOLD)]
+    for path, st in zip(paths, ordered):
+        name = Path(path).name
+        if st:
+            subject = ascii_safe(st.get("last_subject") or "")
+            if len(subject) > 40:
+                subject = subject[:37] + "..."
+            lines.append("  %s  %s  %s  %s  %s" % (
+                st["repo"][:24].ljust(24),
+                st["tree"][:24].ljust(24),
+                work(st).ljust(5),
+                drift(st).ljust(5),
+                subject,
+            ))
+        else:
+            lines.append(c("  %s  %s" % (name[:24].ljust(24), "..."), DIM))
+    done = sum(1 for s in ordered if s)
+    lines.append("")
+    lines.append("%d of %d tree(s) scanned" % (done, len(paths)))
+    return clip_to_height(lines, height, 0)
 
 
 def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all",
@@ -1551,8 +1598,19 @@ def oneshot_scan_progress(done, total, spin_i):
     sys.stderr.flush()
 
 
+def rewrite_status(width, view, args, loading):
+    """Update only the status line so a refresh does not redraw the table."""
+    view_mode = "detail" if view.get("detail") is not None else (
+        "log" if view.get("log") else "table")
+    line = status_line(
+        view["sort"], view["filter"], view["quiet"], args.watch,
+        view_mode, loading=loading)
+    sys.stdout.write("\033[1;1H%s\033[K" % line)
+    sys.stdout.flush()
+
+
 def draw_watch_frame(ansi, width, height, view, args, helping, states,
-                     changed, loading=None):
+                     changed, loading=None, pending=None):
     """One alternate-screen paint. Returns the row list j/k walk."""
     body_h = max(4, height - 1)
     if getattr(args, "json", False):
@@ -1561,6 +1619,10 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
     elif helping:
         out = clip_to_height(help_lines(), body_h, 0)
         shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
+    elif pending is not None:
+        paths, ordered = pending
+        out = render_pending(paths, ordered, width, height=body_h)
+        shown = []
     elif not states:
         if loading:
             out = clip_to_height([loading], body_h, 0)
@@ -1571,17 +1633,17 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
         out = render_view(states, width, view, changed,
                           getattr(args, "github", False), height=body_h)
         shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
-    if ansi:
-        sys.stdout.write("\033[H\033[2J")
-    else:
-        sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
     view_mode = "detail" if view.get("detail") is not None else (
         "log" if view.get("log") else "table")
-    sys.stdout.write(status_line(
+    frame = [status_line(
         view["sort"], view["filter"], view["quiet"], args.watch,
-        view_mode, loading=loading) + "\n")
-    sys.stdout.write("\n".join(out) + "\n")
-    sys.stdout.flush()
+        view_mode, loading=loading)] + list(out)
+    if ansi:
+        write_tty_frame(width, height, frame)
+    else:
+        sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
+        sys.stdout.write("\n".join(frame) + "\n")
+        sys.stdout.flush()
     return shown
 
 
@@ -1596,9 +1658,9 @@ def scan(args, on_progress=None):
     )
     spin = {"n": 0, "last": 0.0}
 
-    def tick(done, total, partial):
+    def tick(done, total, ordered):
         if on_progress:
-            on_progress(done, total, partial)
+            on_progress(done, total, ordered, paths)
         if not oneshot:
             return
         now = time.time()
@@ -1860,7 +1922,7 @@ def main(argv=None):
                 spin_n = [0]
                 last_paint = [0.0]
 
-                def on_progress(done, total, partial):
+                def on_progress(done, total, ordered, paths):
                     now = time.time()
                     if done < total and now - last_paint[0] < 0.12:
                         return
@@ -1868,13 +1930,16 @@ def main(argv=None):
                     loading = "scanning %d/%d %s" % (
                         done, total, SPIN[spin_n[0] % 4])
                     spin_n[0] += 1
-                    # First scan: paint whatever has finished. Later
-                    # refreshes keep the last complete table and only
-                    # spin the status line, so j/k don't jump every tick.
-                    live = partial if not last_states else last_states
+                    if last_states:
+                        # Keep the last grouped table; only the status line
+                        # ticks. Redrawing the body every worker finish is
+                        # what flashed and jumped.
+                        if ansi:
+                            rewrite_status(width, view, args, loading)
+                        return
                     draw_watch_frame(
-                        ansi, width, height, view, args, helping, live,
-                        {}, loading=loading)
+                        ansi, width, height, view, args, helping, [],
+                        {}, loading=loading, pending=(paths, ordered))
 
                 states = scan(
                     args, on_progress=None if args.json else on_progress)

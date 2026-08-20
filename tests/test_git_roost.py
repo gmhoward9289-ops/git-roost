@@ -506,6 +506,19 @@ class TestRender(unittest.TestCase):
         lines = ["a", "b", "c"]
         self.assertEqual(git_roost.clip_to_height(lines, 10, 0), lines)
 
+    def test_render_pending_keeps_discover_order(self):
+        paths = [Path("/tmp/alpha"), Path("/tmp/beta")]
+        empty = "\n".join(git_roost.render_pending(paths, [None, None], width=120))
+        self.assertIn("alpha", empty)
+        self.assertIn("...", empty)
+        filled = git_roost.render_pending(
+            paths, [None, renderable(repo="beta", tree="(primary)", last_ts=1)],
+            width=120)
+        text = "\n".join(filled)
+        self.assertLess(text.find("alpha"), text.find("beta"))
+        self.assertIn("0 of 2", empty)
+        self.assertTrue(any("1 of 2" in ln for ln in filled))
+
     def test_watch_height_does_not_dump_the_whole_fleet(self):
         rows = [renderable(repo="r%02d" % i, last_ts=1) for i in range(40)]
         out = git_roost.render(rows, width=200, expand_quiet=True, height=12, cursor=0)
@@ -774,7 +787,7 @@ class TestWatchKeys(unittest.TestCase):
             hits = []
 
             def cb(done, total, states):
-                hits.append((done, total, len(states)))
+                hits.append((done, total, len([s for s in states if s])))
 
             out = git_roost.collect(
                 git_roost.discover([Path(tmp)]), on_progress=cb)
