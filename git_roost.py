@@ -11,7 +11,8 @@ answer a question about thirty trees at once, which is exactly the question you
 have when a dozen agents are working in parallel: who is diverged, who has
 uncommitted work nobody has looked at, who is stuck mid-rebase.
 
-    git-roost                # one table, most actionable first
+    git-roost                # one table; usual checkout folders, then cwd
+    git-roost --root ~/dev   # scan a specific tree of checkouts
     git-roost -w             # redraw every 3s (the top view)
     git-roost --log          # commit feed across every repo, newest first
     git-roost --all          # expand the QUIET group
@@ -53,7 +54,7 @@ import shutil
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Raw single-key reads in watch mode. curses would have been the obvious choice
@@ -85,15 +86,23 @@ __version__ = "0.3.1"
 
 HOME = Path.home()
 
-# ~/GitHub is where every repo on this machine lives. Overridable because that
-# is a fact about one box, not about git -- GIT_ROOST_ROOT for the daily
-# default (os.pathsep-separated for more than one root, matching PATH), --root
-# for a one-off override.
-_env_roots = os.environ.get("GIT_ROOST_ROOT")
-if _env_roots:
-    DEFAULT_ROOTS = tuple(Path(p).expanduser() for p in _env_roots.split(os.pathsep) if p)
-else:
-    DEFAULT_ROOTS = (HOME / "GitHub",)
+# Folders people actually keep checkouts in, relative to $HOME. A bare
+# `git-roost` after install walks whichever of these exist -- not a single
+# path that happens to be true on one author's machine. GIT_ROOST_ROOT
+# (os.pathsep-separated, same convention as PATH) and --root still override.
+WELL_KNOWN_RELATIVE = (
+    Path("GitHub"),
+    Path("dev"),
+    Path("src"),
+    Path("code"),
+    Path("projects"),
+    Path("Projects"),
+    Path("repos"),
+    Path("work"),
+    Path("git"),
+    Path("Documents") / "GitHub",  # GitHub Desktop on Windows/macOS
+    Path("source") / "repos",      # Visual Studio
+)
 
 # How deep to look for a repo below a root. Worktrees live at
 # <root>/.worktrees/<repo>/<slug>, which is depth 3, so 3 is the floor and the
@@ -106,6 +115,7 @@ PRUNE = frozenset((
     "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
     ".pytest_cache", "build", "dist", "target", ".next", ".cargo", "Library",
     ".Trash", "vendor", ".terraform",
+    "AppData", "Application Data",
 ))
 
 # Worktrees can live inside the repo as well as beside it: ccwork puts them at
@@ -280,12 +290,15 @@ def git(dirpath, *args):
     could learn and dashes for the rest.
     """
     check_read_only(args)
+    kwargs = dict(capture_output=True, text=True, timeout=GIT_TIMEOUT)
+    if sys.platform == "win32":
+        # Avoid flashing a console per git.exe spawn; on a fleet of ~80 trees
+        # that allocation is a measurable slice of the one-shot wait.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         out = subprocess.run(
             ("git", "-C", str(dirpath)) + tuple(args),
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT,
+            **kwargs,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -561,16 +574,31 @@ def tree_state(path):
     return st
 
 
-def collect(paths):
+SPIN = "|/-\\"
+
+
+def collect(paths, on_progress=None):
     # Repo-level facts are memoized within a scan and must not survive it: in
     # watch mode a stale cache would keep showing a stash that was just popped.
+    #
+    # Completion order is not path order: as_completed fires whenever a worker
+    # finishes, which is what lets a spinner / partial table paint before the
+    # slowest tree. Results are stored by original index so --json stays stable.
     with _repo_lock:
         _repo_cache.clear()
     if not paths:
         return []
+    ordered = [None] * len(paths)
     with ThreadPoolExecutor(max_workers=min(GIT_WORKERS, len(paths))) as pool:
-        states = list(pool.map(tree_state, paths))
-    return [s for s in states if s]
+        fmap = {pool.submit(tree_state, p): i for i, p in enumerate(paths)}
+        finished = 0
+        for fut in as_completed(fmap):
+            ordered[fmap[fut]] = fut.result()
+            finished += 1
+            if on_progress:
+                ready = [s for s in ordered if s]
+                on_progress(finished, len(paths), ready)
+    return [s for s in ordered if s]
 
 
 # ------------------------------------------------------------------- grouping
@@ -700,22 +728,176 @@ def visible_rows(states, expand_quiet=False, sort_mode="recent", filt="all"):
     return [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
 
 
+def well_known_root_paths(home=None):
+    home = Path(home or HOME)
+    return [home / rel for rel in WELL_KNOWN_RELATIVE]
+
+
+def default_roots(home=None, cwd=None, env=None):
+    """Where a bare `git-roost` looks, computed at scan time.
+
+    1. GIT_ROOST_ROOT, if set.
+    2. Every well-known checkout folder under $HOME that exists.
+    3. Otherwise the current directory, unless that *is* $HOME -- walking a
+       whole homedir is slow and picks up AppData / Library junk.
+    """
+    if env is None:
+        env = os.environ.get("GIT_ROOST_ROOT")
+    if env:
+        return tuple(Path(p).expanduser() for p in env.split(os.pathsep) if p)
+    home = Path(home or HOME)
+    if cwd is None:
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            cwd = home
+    else:
+        cwd = Path(cwd)
+    found = []
+    seen = set()
+    for path in well_known_root_paths(home):
+        try:
+            if not path.is_dir():
+                continue
+            key = str(path.resolve())
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(path)
+    if found:
+        return tuple(found)
+    try:
+        if cwd.is_dir() and cwd.resolve() != home.resolve():
+            return (cwd,)
+    except OSError:
+        pass
+    return ()
+
+
+def resolved_roots(args, home=None, cwd=None):
+    """The directories this invocation will walk. --root wins; else default_roots()."""
+    if getattr(args, "root", None):
+        return [Path(r).expanduser() for r in args.root]
+    return list(default_roots(home=home, cwd=cwd))
+
+
+def empty_fleet_lines(roots, depth=DEFAULT_DEPTH, home=None, cwd=None):
+    """What a first run prints when the scan found nothing.
+
+    Name what was searched, and the two ways to point the next run at a
+    folder of checkouts. A missing ~/GitHub used to be the whole story;
+    most installs keep trees in ~/dev or ~/src instead.
+    """
+    home = Path(home or HOME)
+    if cwd is None:
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            cwd = home
+    else:
+        cwd = Path(cwd)
+    lines = ["no git repositories found", ""]
+    if roots:
+        lines.append("looked under (depth %d):" % depth)
+        for raw in roots:
+            path = Path(raw).expanduser()
+            if not path.exists():
+                note = "does not exist"
+            elif not path.is_dir():
+                note = "not a directory"
+            else:
+                note = "exists, no git repo within depth"
+            lines.append("  %s  (%s)" % (path, note))
+        lines.append("")
+        lines.append("Point git-roost at a folder of checkouts:")
+    else:
+        lines.append("A bare git-roost looks in the usual checkout folders")
+        lines.append("under your home directory. None of those exist yet:")
+        for path in well_known_root_paths(home):
+            lines.append("  %s" % path)
+        lines.append("")
+        try:
+            if cwd.resolve() == home.resolve():
+                lines.append(
+                    "Did not walk %s -- a home directory is too wide." % cwd)
+                lines.append("")
+        except OSError:
+            pass
+        lines.append("Point git-roost at a folder of checkouts:")
+    lines.extend([
+        "",
+        "  git-roost --root ~/dev              # one tree of checkouts",
+        "  git-roost --root .                  # this directory, still depth %d" % depth,
+        "  git-roost --root ~/dev --root ~/src # repeatable",
+        "",
+        "Daily default (%s-separated, same convention as PATH):" % os.pathsep,
+        "  GIT_ROOST_ROOT=~/dev git-roost",
+    ])
+    return lines
+
+
+def empty_result_lines(args):
+    """Empty scan vs empty --repo filter: two different next steps."""
+    if getattr(args, "repo", None):
+        return ["no repo matches: %s" % ", ".join(args.repo)]
+    return empty_fleet_lines(resolved_roots(args), getattr(args, "depth", DEFAULT_DEPTH))
+
+
+def clip_to_height(lines, height, focus=0):
+    """Fit a rendered frame into a terminal that is shorter than the table.
+
+    Watch mode is a TUI, not a dump: 85 trees must not push the status line
+    and `?` off the top of the screen. Keep the header and the summary, and
+    slide the middle so `focus` (the cursor row's line) stays in view.
+    One-shot renders pass height=None and are not clipped -- `git-roost |
+    less` still gets the whole list.
+    """
+    if height is None or height <= 0 or len(lines) <= height:
+        return list(lines)
+    if height == 1:
+        return [lines[0]]
+    header = lines[0]
+    footer = lines[-1]
+    inner = lines[1:-1]
+    inner_h = height - 2
+    if inner_h <= 0:
+        return [header, footer][:height]
+    if len(inner) <= inner_h:
+        return [header] + inner + [footer]
+    focus_inner = max(0, min(int(focus) - 1, len(inner) - 1))
+    start = focus_inner - inner_h // 2
+    start = max(0, min(start, len(inner) - inner_h))
+    window = inner[start:start + inner_h]
+    above = start
+    below = len(inner) - start - len(window)
+    if above and window:
+        window[0] = c("  ... %d more above  (k)" % above, DIM)
+    if below and window:
+        window[-1] = c("  ... %d more below  (j)" % below, DIM)
+    return [header] + window + [footer]
+
+
 def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all",
-           changed=None, github=False):
+           changed=None, github=False, cursor=None, height=None):
     """`changed` is a set of tree paths whose bucket, WORK or DRIFT differ from
     the previous watch-mode frame -- see frame_signature(). None outside watch
     mode, where there is no previous frame to compare against. `github` adds
-    the opt-in PR/CI column -- see GITHUB_COLUMN.
+    the opt-in PR/CI column -- see GITHUB_COLUMN. `cursor` is the highlighted
+    row index in the shown list (watch mode). `height` clips the frame to a
+    terminal, keeping that row in view.
     """
     if not states:
-        return ["no git repositories found"]
+        return clip_to_height(["no git repositories found"], height, 0)
 
     fleet = states
     total = len(states)
     if filt != "all":
         states = [s for s in states if passes_filter(s, filt)]
         if not states:
-            return ["no tree matches filter: %s" % FILTER_LABELS[filt]]
+            return clip_to_height(
+                ["no tree matches filter: %s" % FILTER_LABELS[filt]], height, 0)
 
     rows = sorted(states, key=lambda st: sort_key(st, sort_mode))
     shown = [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
@@ -742,6 +924,8 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
     ) + "  " + "SUBJECT", BOLD))
 
     current = None
+    focus_line = 0
+    row_i = 0
     for st, row in zip(shown, cells):
         order, label = bucket(st)
         if label != current:
@@ -759,11 +943,21 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
             subject = subject[: subject_w - 3] + "..."
         body = "  ".join(row[i].ljust(widths[i]) for i in range(len(columns)))
         is_changed = bool(changed) and st["path"] in changed
-        marker = "* " if is_changed else "  "
+        is_cursor = cursor is not None and row_i == cursor
+        if is_cursor:
+            focus_line = len(lines)
+            marker = "> "
+        elif is_changed:
+            marker = "* "
+        else:
+            marker = "  "
         line = marker + body + "  " + subject
-        if is_changed:
+        if is_cursor:
+            line = c(line, BOLD, CYAN)
+        elif is_changed:
             line = c(line, MAGENTA, BOLD)
         lines.append(line)
+        row_i += 1
 
     if quiet:
         names = " . ".join(sorted({"%s/%s" % (s["repo"], s["tree"]) for s in quiet}))
@@ -792,7 +986,7 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
     if stuck:
         summary += "  |  %d mid-operation" % stuck
     lines.append(summary)
-    return lines
+    return clip_to_height(lines, height, focus_line)
 
 
 # ---------------------------------------------------------------- commit feed
@@ -818,7 +1012,7 @@ def commits_for(st, limit):
     return rows
 
 
-def render_log(states, limit, width=160):
+def render_log(states, limit, width=160, height=None):
     """One merged feed, newest first.
 
     Deduped by (common dir, sha): a repo and its worktrees share history, so
@@ -851,7 +1045,7 @@ def render_log(states, limit, width=160):
     merged.sort(key=lambda r: -r["ts"])
     merged = merged[:limit]
     if not merged:
-        return ["no commits found"]
+        return clip_to_height(["no commits found"], height, 0)
 
     now = time.time()
     w_repo = max([4] + [len(r["repo"]) for r in merged])
@@ -878,7 +1072,7 @@ def render_log(states, limit, width=160):
         )))
     lines.append("")
     lines.append("%d commit(s) across %d repo(s)" % (len(merged), len({r["repo"] for r in merged})))
-    return lines
+    return clip_to_height(lines, height, 0)
 
 
 def frame_signature(st):
@@ -891,7 +1085,7 @@ def frame_signature(st):
     return (bucket(st)[1], work(st), drift(st))
 
 
-def detail_lines(st, width=160):
+def detail_lines(st, width=160, height=None):
     """Everything one tree has that the table has no room for: the whole
     stash list rather than a count, what it is stuck doing, and its last five
     commits.
@@ -947,7 +1141,7 @@ def detail_lines(st, width=160):
                 ascii_safe(r["subject"])))
     lines.append("")
     lines.append(c("any other key returns to the table", DIM))
-    return lines
+    return clip_to_height(lines, height, 0)
 
 
 # ---------------------------------------------------------------- github (gh)
@@ -1157,8 +1351,8 @@ KEYMAP = (
     ("f", "filter: all / uncommitted / mid-operation"),
     ("a", "expand or collapse QUIET"),
     ("l", "toggle table / commit feed"),
-    ("j", "move the cursor down"),
-    ("k", "move the cursor up"),
+    ("j", "move the cursor down (scrolls the viewport)"),
+    ("k", "move the cursor up (scrolls the viewport)"),
     ("enter", "open a detail view for the highlighted tree"),
     ("q", "quit"),
 )
@@ -1316,13 +1510,16 @@ def apply_key(view, key, shown=None):
     return None
 
 
-def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table"):
+def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table",
+                loading=None):
     """The one line that says what view you are looking at.
 
     Without it a filtered table is indistinguishable from a fleet that happens
     to be quiet, which is the same failure the summary line guards against.
     `view_mode` is "table", "log" or "detail" -- `l` and `enter` change what is
     on screen independently of sort/filter/quiet, so it needs saying too.
+    `loading` is the watch-mode spinner ("scanning 12/92 |") while collect()
+    is still in flight -- None once the frame is complete.
     """
     bits = [
         time.strftime("git-roost  %H:%M:%S"),
@@ -1332,14 +1529,93 @@ def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table"):
         "quiet:%s" % ("shown" if expand_quiet else "collapsed"),
         "%gs" % interval,
     ]
+    if loading:
+        bits.append(loading)
     return c("  ".join(bits), DIM) + c("   [?] keys", BOLD)
 
 
 # ------------------------------------------------------------------------ cli
 
-def scan(args):
-    roots = [Path(r).expanduser() for r in args.root] if args.root else list(DEFAULT_ROOTS)
-    states = collect(discover(roots, args.depth))
+def oneshot_scan_progress(done, total, spin_i):
+    """One stderr line for a bare `git-roost` -- not used in -w.
+
+    Starts as `scanning 92 tree(s)...` and ticks `12/92` plus a spinner
+    until the collect finishes, then restores the same wording with a newline
+    so the table that follows is what people already expect.
+    """
+    if done <= 0 or done >= total:
+        msg = "scanning %d tree(s)..." % total
+    else:
+        msg = "scanning %d/%d tree(s)... %s" % (done, total, SPIN[spin_i % 4])
+    sys.stderr.write("\r" + msg.ljust(44))
+    sys.stderr.flush()
+
+
+def draw_watch_frame(ansi, width, height, view, args, helping, states,
+                     changed, loading=None):
+    """One alternate-screen paint. Returns the row list j/k walk."""
+    body_h = max(4, height - 1)
+    if getattr(args, "json", False):
+        out = [json.dumps(states, indent=2, sort_keys=True)]
+        shown = []
+    elif helping:
+        out = clip_to_height(help_lines(), body_h, 0)
+        shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
+    elif not states:
+        if loading:
+            out = clip_to_height([loading], body_h, 0)
+        else:
+            out = clip_to_height(empty_result_lines(args), body_h, 0)
+        shown = []
+    else:
+        out = render_view(states, width, view, changed,
+                          getattr(args, "github", False), height=body_h)
+        shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
+    if ansi:
+        sys.stdout.write("\033[H\033[2J")
+    else:
+        sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
+    view_mode = "detail" if view.get("detail") is not None else (
+        "log" if view.get("log") else "table")
+    sys.stdout.write(status_line(
+        view["sort"], view["filter"], view["quiet"], args.watch,
+        view_mode, loading=loading) + "\n")
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+    return shown
+
+
+def scan(args, on_progress=None):
+    roots = resolved_roots(args)
+    paths = discover(roots, args.depth)
+    oneshot = (
+        bool(paths)
+        and not getattr(args, "json", False)
+        and not getattr(args, "watch", None)
+        and sys.stderr.isatty()
+    )
+    spin = {"n": 0, "last": 0.0}
+
+    def tick(done, total, partial):
+        if on_progress:
+            on_progress(done, total, partial)
+        if not oneshot:
+            return
+        now = time.time()
+        if done < total and now - spin["last"] < 0.08:
+            return
+        spin["last"] = now
+        oneshot_scan_progress(done, total, spin["n"])
+        spin["n"] += 1
+
+    if oneshot:
+        oneshot_scan_progress(0, len(paths), 0)
+    cb = tick if (oneshot or on_progress) else None
+    states = collect(paths, on_progress=cb)
+    if oneshot:
+        oneshot_scan_progress(len(paths), len(paths), 0)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
     if args.repo:
         # A substring match, not exact: "--repo roost" finding both roost and
         # git-roost is a feature here, not ambiguity -- there is no id to match
@@ -1384,6 +1660,10 @@ def body(args, width, view=None, changed=None, github_map=None):
         if filt != "all":
             states = [s for s in states if passes_filter(s, filt)]
         return [json.dumps(states, indent=2, sort_keys=True)], states
+    if not states:
+        # First-run / wrong-root: say where we looked. An empty --log feed
+        # of nothing is the same situation as an empty table.
+        return empty_result_lines(args), states
     if view is None:
         if args.log is not None:
             return render_log(states, args.log, width), states
@@ -1393,12 +1673,13 @@ def body(args, width, view=None, changed=None, github_map=None):
     return render_view(states, width, view, changed, show_github), states
 
 
-def render_view(states, width, view, changed=None, github=False):
+def render_view(states, width, view, changed=None, github=False, height=None):
     """Render one already-scanned watch-mode frame from the live view state.
 
     Split out of body() so the watch loop can reuse a single scan for both the
     rendered frame and the cursor's row list, instead of scanning twice a
-    redraw.
+    redraw. `height` is the body budget after the status line -- None means
+    do not clip (the one-shot path).
     """
     if view.get("detail") is not None:
         target = view["detail"]
@@ -1407,13 +1688,14 @@ def render_view(states, width, view, changed=None, github=False):
         # has vanished (worktree removed mid-session), fall back to what was
         # last known about it rather than crashing.
         current = next((s for s in states if s["path"] == target["path"]), None)
-        return detail_lines(current or target, width)
+        return detail_lines(current or target, width, height=height)
     if view.get("log"):
         limit = view.get("log_limit") or 25
-        return render_log(states, limit, width)
+        return render_log(states, limit, width, height=height)
     return render(states, width, expand_quiet=view["quiet"],
                   sort_mode=view["sort"], filt=view["filter"],
-                  changed=changed, github=github)
+                  changed=changed, github=github,
+                  cursor=view.get("cursor"), height=height)
 
 
 def exit_code(states, fail_on):
@@ -1442,7 +1724,13 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         prog="git-roost",
-        description="top for git -- every repo and worktree, most actionable first.",
+        description=(
+            "top for git -- every repo and worktree, most actionable first.\n\n"
+            "Bare run scans the usual checkout folders under your home directory\n"
+            "(~/dev, ~/src, ~/GitHub, ~/Documents/GitHub, ...) that exist. If none\n"
+            "do, it scans the current directory -- unless that is $HOME, which is\n"
+            "too wide. Pass --root DIR or set GIT_ROOST_ROOT to choose."
+        ),
         epilog=("watch-mode keys:  " + "  ".join(
             "%s %s" % (k, d.split(":")[0].split("(")[0].strip())
             for k, d in KEYMAP)),
@@ -1456,8 +1744,11 @@ def main(argv=None):
     ap.add_argument("--log", nargs="?", const=25, type=int, metavar="N",
                     help="commit feed across every repo, newest first (default 25)")
     ap.add_argument("-a", "--all", action="store_true", help="expand the QUIET group")
-    ap.add_argument("--root", action="append", metavar="DIR",
-                    help="where to look for repos (repeatable; default $GIT_ROOST_ROOT or ~/GitHub)")
+    ap.add_argument("--root", action="append", nargs="?", const=".", metavar="DIR",
+                    help="where to look for repos (repeatable; omit DIR to "
+                         "mean the current directory. Default with no --root: "
+                         "$GIT_ROOST_ROOT, else the usual checkout folders "
+                         "under $HOME that exist, else the current directory)")
     ap.add_argument("--depth", type=int, default=DEFAULT_DEPTH, metavar="N",
                     help="how deep to search below each root (default %d)" % DEFAULT_DEPTH)
     ap.add_argument("--repo", action="append", metavar="NAME",
@@ -1554,15 +1845,44 @@ def main(argv=None):
     last_gh_fetch = 0.0
 
     try:
+        if ansi:
+            # Alternate screen + hidden cursor: a 85-row dump must not become
+            # scrollback the operator is stuck at the bottom of, with [? keys]
+            # sitting above the fold.
+            sys.stdout.write("\033[?1049h\033[?25l")
+            sys.stdout.flush()
         with Keys() as keys:
+            shown = []
             while True:
-                width = shutil.get_terminal_size((160, 24)).columns
-                states = scan(args)
+                size = shutil.get_terminal_size((160, 24))
+                width = size.columns
+                height = max(8, size.lines)
+                spin_n = [0]
+                last_paint = [0.0]
+
+                def on_progress(done, total, partial):
+                    now = time.time()
+                    if done < total and now - last_paint[0] < 0.12:
+                        return
+                    last_paint[0] = now
+                    loading = "scanning %d/%d %s" % (
+                        done, total, SPIN[spin_n[0] % 4])
+                    spin_n[0] += 1
+                    # First scan: paint whatever has finished. Later
+                    # refreshes keep the last complete table and only
+                    # spin the status line, so j/k don't jump every tick.
+                    live = partial if not last_states else last_states
+                    draw_watch_frame(
+                        ansi, width, height, view, args, helping, live,
+                        {}, loading=loading)
+
+                states = scan(
+                    args, on_progress=None if args.json else on_progress)
                 last_states = states
 
                 if args.json:
-                    out = [json.dumps(states, indent=2, sort_keys=True)]
-                    shown = []
+                    shown = draw_watch_frame(
+                        ansi, width, height, view, args, helping, states, {})
                 else:
                     if args.github:
                         now = time.time()
@@ -1576,22 +1896,9 @@ def main(argv=None):
                     changed = {p for p, sig in cur_sig.items()
                                if p in prev_sig and prev_sig[p] != sig}
                     prev_sig = cur_sig
-                    out = help_lines() if helping else render_view(
-                        states, width, view, changed, args.github)
-                    shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
-
-                if ansi:
-                    sys.stdout.write("\033[H\033[2J")
-                else:
-                    # No VT support: a rule beats escape codes printed literally.
-                    sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
-                view_mode = "detail" if view.get("detail") is not None else (
-                    "log" if view.get("log") else "table")
-                sys.stdout.write(status_line(
-                    view["sort"], view["filter"], view["quiet"], args.watch,
-                    view_mode) + "\n\n")
-                sys.stdout.write("\n".join(out) + "\n")
-                sys.stdout.flush()
+                    shown = draw_watch_frame(
+                        ansi, width, height, view, args, helping, states,
+                        changed)
 
                 # The help overlay waits for a key rather than timing out under
                 # the reader. A keymap that vanished after 3s would be gone at
@@ -1614,6 +1921,10 @@ def main(argv=None):
                 helping = action == "help"
     except KeyboardInterrupt:
         pass
+    finally:
+        if ansi:
+            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.flush()
     return exit_code(last_states, args.fail_on)
 
 

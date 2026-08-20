@@ -3,11 +3,14 @@ Output git-roost-loop.gif
 Set Shell "bash"
 Set FontSize 13
 Set Width 1400
-Set Height 560
+Set Height 580
 Set Padding 14
 
 # Touching the marker is what starts setup_fleet.py --live's schedule, so the
-# transitions land on camera instead of during vhs's warm-up.
+# transitions land on camera instead of during vhs's warm-up. Rows that
+# change group, WORK or DRIFT pick up a leading * (0.3); that is the whole
+# reason to re-record this loop against current git-roost rather than keep
+# the 0.2 GIF.
 Hide
 Type "export PATH=$PWD/bin:$PATH && touch /tmp/git-roost-demo-go && clear"
 Enter
@@ -18,7 +21,7 @@ Type@120ms "git-roost -w 2 --root /tmp/git-roost-demo/fleet"
 Sleep 600ms
 Enter
 
-# t+5s  salt-marsh-docs goes dirty and climbs out of the collapsed QUIET line
+# t+5s  salt-marsh-docs goes dirty, marked *, climbs out of collapsed QUIET
 Sleep 10s
 
 # expand QUIET so the tree it just left is visible too

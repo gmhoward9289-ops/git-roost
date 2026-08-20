@@ -90,6 +90,10 @@ class GitRoost < Formula
     <<~EOS
       git-roost reads local git state and needs `git` on PATH.
 
+      After install, run `git-roost`. It scans the usual checkout folders under
+      your home directory that exist (~/dev, ~/src, ~/GitHub, ...). Override with
+      --root DIR or GIT_ROOST_ROOT.
+
       It is read-only by construction: every git invocation is checked against an
       allowlist of plumbing that cannot mutate a tree, an index, or a ref.
     EOS

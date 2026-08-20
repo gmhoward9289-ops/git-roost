@@ -25,10 +25,25 @@ its first argument together, since
 and
 .B stash pop
 are not the same kind of operation.
+.PP
+A bare run scans the usual checkout folders under the home directory that
+exist (\fB~/dev\fR, \fB~/src\fR, \fB~/GitHub\fR, \fB~/Documents/GitHub\fR,
+and similar). If none exist, it scans the current directory. It does not walk
+.B $HOME
+itself. Override with
+.B \-\-root
+or
+.BR $GIT_ROOST_ROOT .
+If nothing is found, the table is replaced by the paths that were searched
+and the
+.B \-\-root
+invocation that would scan somewhere else.
 .SH OPTIONS
 .TP
 .BR \-w ", " \-\-watch " [\fISECS\fR]"
-Redraw every \fISECS\fR seconds, default 3.
+Redraw every \fISECS\fR seconds, default 3. This is a viewport the size of
+the terminal, not a scrolling dump: the status line stays on screen and
+\fBj\fR/\fBk\fR move a row cursor through trees that do not fit.
 .TP
 .BR \-\-log " [\fIN\fR]"
 Show a commit feed merged across every repository, newest first, default 25
@@ -42,7 +57,12 @@ Render once and exit. This is the default; it overrides \fB\-\-watch\fR.
 Expand the collapsed QUIET group.
 .TP
 .BR \-\-root " \fIDIR\fR"
-Where to look for repositories. Repeatable. Defaults to ~/GitHub.
+Where to look for repositories. Repeatable. Default is
+.BR $GIT_ROOST_ROOT
+if set, otherwise the usual checkout folders under the home directory that
+exist, otherwise the current directory (never
+.B $HOME
+itself).
 .TP
 .BR \-\-depth " \fIN\fR"
 How deep to search below each root, default 3. Worktrees kept beside a repo live
@@ -78,6 +98,15 @@ Number of stash entries, blank when there are none.
 .B LAST
 Age of the most recent commit.
 .SH ENVIRONMENT
+.TP
+.B GIT_ROOST_ROOT
+Directories to search, separated like
+.B PATH
+(colon on Unix, semicolon on Windows). When unset, git-roost uses the usual
+checkout folders under the home directory that exist, else the current
+directory.
+.B \-\-root
+overrides this for one invocation.
 .TP
 .B GIT_ROOST_WORKERS
 Size of the thread pool used to scan trees. Default 12.
