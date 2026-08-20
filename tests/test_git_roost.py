@@ -761,6 +761,28 @@ class TestWatchKeys(unittest.TestCase):
         self.assertIn("filter:uncommitted", line)
         self.assertIn("quiet:collapsed", line)
 
+    def test_status_line_shows_a_loading_spinner(self):
+        line = git_roost.status_line(
+            "recent", "all", False, 3.0, loading="scanning 3/9 |")
+        self.assertIn("scanning 3/9", line)
+
+    @needs_git
+    def test_collect_progress_reaches_the_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "a")
+            make_repo(Path(tmp) / "b")
+            hits = []
+
+            def cb(done, total, states):
+                hits.append((done, total, len(states)))
+
+            out = git_roost.collect(
+                git_roost.discover([Path(tmp)]), on_progress=cb)
+            self.assertEqual(len(out), 2)
+            self.assertEqual(hits[-1][0], hits[-1][1])
+            self.assertEqual(hits[-1][2], 2)
+            self.assertGreaterEqual(len(hits), 2)
+
     def test_body_accepts_a_live_view(self):
         # Regression: body() gained its `view` parameter in one edit and the
         # watch loop started passing it in another. The suite stayed green
