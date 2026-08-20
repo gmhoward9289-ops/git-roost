@@ -494,6 +494,50 @@ class TestRender(unittest.TestCase):
     def test_empty_scan_says_so_rather_than_crashing(self):
         self.assertEqual(git_roost.render([]), ["no git repositories found"])
 
+    def test_clip_to_height_keeps_header_and_summary(self):
+        lines = ["HEAD"] + ["r%d" % i for i in range(20)] + ["SUM"]
+        out = git_roost.clip_to_height(lines, 6, focus=1)
+        self.assertEqual(len(out), 6)
+        self.assertEqual(out[0], "HEAD")
+        self.assertEqual(out[-1], "SUM")
+        self.assertTrue(any("more below" in ln for ln in out))
+
+    def test_clip_to_height_is_a_noop_when_the_frame_fits(self):
+        lines = ["a", "b", "c"]
+        self.assertEqual(git_roost.clip_to_height(lines, 10, 0), lines)
+
+    def test_watch_height_does_not_dump_the_whole_fleet(self):
+        rows = [renderable(repo="r%02d" % i, last_ts=1) for i in range(40)]
+        out = git_roost.render(rows, width=200, expand_quiet=True, height=12, cursor=0)
+        self.assertLessEqual(len(out), 12)
+        self.assertTrue(any("40 tree(s)" in ln for ln in out))
+
+    def test_cursor_row_is_marked(self):
+        rows = [renderable(repo="aa", last_ts=1), renderable(repo="bb", last_ts=1)]
+        out = "\n".join(git_roost.render(rows, width=200, expand_quiet=True, cursor=1))
+        self.assertIn("> ", out)
+
+    def test_empty_fleet_names_the_root_and_the_next_command(self):
+        missing = Path("/no-such-git-roost-root")
+        lines = git_roost.empty_fleet_lines([missing], depth=3)
+        text = "\n".join(lines)
+        self.assertEqual(lines[0], "no git repositories found")
+        self.assertIn(str(missing), text)
+        self.assertIn("does not exist", text)
+        self.assertIn("Point git-roost at a folder of checkouts", text)
+        self.assertIn("--root", text)
+        self.assertIn("GIT_ROOST_ROOT", text)
+
+    def test_empty_result_distinguishes_a_repo_filter_miss(self):
+        class Args:
+            root = [str(Path("/tmp"))]
+            depth = 3
+            repo = ["nope"]
+        self.assertEqual(
+            git_roost.empty_result_lines(Args()),
+            ["no repo matches: nope"],
+        )
+
     @needs_git
     def test_table_contains_every_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -738,8 +782,10 @@ class TestWatchKeys(unittest.TestCase):
             args.root = [tmp]
             view = {"sort": "repo", "filter": "dirty", "quiet": True}
             lines, states = git_roost.body(args, 200, view)
-            self.assertEqual(lines, ["no git repositories found"])
             self.assertEqual(states, [])
+            self.assertEqual(lines[0], "no git repositories found")
+            self.assertTrue(any(tmp in line for line in lines))
+            self.assertTrue(any("--root" in line for line in lines))
 
     def test_body_without_a_view_renders_the_one_shot_table(self):
         # The contract behind `git-roost | less` and `git-roost --json | jq`:
@@ -759,8 +805,10 @@ class TestWatchKeys(unittest.TestCase):
             args = Args()
             args.root = [tmp]
             lines, states = git_roost.body(args, 200)
-            self.assertEqual(lines, ["no git repositories found"])
             self.assertEqual(states, [])
+            self.assertEqual(lines[0], "no git repositories found")
+            self.assertTrue(any(tmp in line for line in lines))
+            self.assertTrue(any("Point git-roost at a folder of checkouts" in line for line in lines))
 
 
 class TestCursorAndDetail(unittest.TestCase):
@@ -972,7 +1020,26 @@ class TestCli(unittest.TestCase):
             with redirect_stdout(buf):
                 rc = git_roost.main(["--root", tmp])
             self.assertEqual(rc, 0)
-            self.assertIn("no git repositories found", buf.getvalue())
+            out = buf.getvalue()
+            self.assertIn("no git repositories found", out)
+            self.assertIn(tmp, out)
+            self.assertIn("GIT_ROOST_ROOT", out)
+
+    @needs_git
+    def test_root_flag_with_no_path_means_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            prev = os.getcwd()
+            buf = io.StringIO()
+            try:
+                os.chdir(tmp)
+                with redirect_stdout(buf):
+                    rc = git_roost.main(["--root", "--json"])
+            finally:
+                os.chdir(prev)
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            self.assertEqual([r["repo"] for r in data], ["alpha"])
 
     @needs_git
     def test_json_is_valid_and_machine_readable(self):
@@ -1331,26 +1398,51 @@ class TestGithubFlagGating(unittest.TestCase):
 
 class TestRootEnvVar(unittest.TestCase):
     def test_git_roost_root_overrides_the_default(self):
-        env = {k: v for k, v in os.environ.items() if k != "GIT_ROOST_ROOT"}
-        env["GIT_ROOST_ROOT"] = str(Path("/tmp/one")) + os.pathsep + str(Path("/tmp/two"))
-        out = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; sys.path.insert(0, %r); import git_roost; "
-             "print([str(p) for p in git_roost.DEFAULT_ROOTS])" % str(ROOT)],
-            env=env, capture_output=True, text=True, check=True,
+        roots = git_roost.default_roots(
+            env=str(Path("/tmp/one")) + os.pathsep + str(Path("/tmp/two")),
         )
-        self.assertIn("one", out.stdout)
-        self.assertIn("two", out.stdout)
+        self.assertEqual([p.name for p in roots], ["one", "two"])
 
-    def test_default_root_when_unset(self):
-        env = {k: v for k, v in os.environ.items() if k != "GIT_ROOST_ROOT"}
-        out = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; sys.path.insert(0, %r); import git_roost; "
-             "print([str(p) for p in git_roost.DEFAULT_ROOTS])" % str(ROOT)],
-            env=env, capture_output=True, text=True, check=True,
-        )
-        self.assertIn("GitHub", out.stdout)
+    def test_default_roots_use_well_known_dirs_that_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "dev").mkdir()
+            (home / "GitHub").mkdir()
+            roots = git_roost.default_roots(home=home, cwd=home, env="")
+            self.assertEqual({p.name for p in roots}, {"dev", "GitHub"})
+
+    def test_default_roots_do_not_walk_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            roots = git_roost.default_roots(home=home, cwd=home, env="")
+            self.assertEqual(roots, ())
+
+    def test_default_roots_fall_back_to_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            proj = Path(tmp) / "proj"
+            home.mkdir()
+            proj.mkdir()
+            roots = git_roost.default_roots(home=home, cwd=proj, env="")
+            self.assertEqual(list(roots), [proj])
+
+    def test_empty_fleet_with_no_roots_lists_usual_places(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            text = "\n".join(git_roost.empty_fleet_lines((), home=home, cwd=home))
+            self.assertIn("usual checkout folders", text)
+            self.assertIn("home directory is too wide", text)
+            self.assertIn(str(home / "dev"), text)
+            self.assertIn(str(home / "GitHub"), text)
+
+    @needs_git
+    def test_bare_run_finds_a_repo_in_home_dev(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            make_repo(home / "dev" / "alpha")
+            roots = git_roost.default_roots(home=home, cwd=home, env="")
+            found = {p.name for p in git_roost.discover(roots, depth=3)}
+            self.assertEqual(found, {"alpha"})
 
     @needs_git
     def test_repo_flag_scopes_to_a_substring_match(self):

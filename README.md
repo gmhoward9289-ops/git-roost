@@ -17,11 +17,11 @@ and only one of those two can be wrong.
 
 One file, no dependencies, Python 3.9+, macOS/Linux/Windows.
 
-![git-roost's table re-sorting as a synthetic fleet drifts, goes uncommitted, and gets pushed](demo/git-roost-demo.gif)
+![git-roost watch mode: cost-of-ignoring groups, a > cursor, a detail view, the keymap, and the commit feed](demo/git-roost-demo.gif)
 
-The short ambient loop below is the same program, watching quietly:
+The short ambient loop below is the same program, watching quietly. A row that changes group, WORK or DRIFT is marked `*`:
 
-![git-roost's watch mode, idling until a tree goes dirty and climbs out of QUIET](demo/git-roost-loop.gif)
+![git-roost's watch mode, idling until a tree goes dirty, is marked *, and climbs out of QUIET](demo/git-roost-loop.gif)
 
 Recorded against a synthetic fixture, not a real machine — see
 [`demo/`](demo/) for how. Text fallback, same shape:
@@ -73,6 +73,37 @@ chmod +x git_roost.py && ./git_roost.py
 Installed under any of those names, `git roost` works too: git dispatches an
 unknown subcommand to a `git-<name>` on PATH.
 
+Then run it:
+
+```bash
+git-roost
+```
+
+That is the whole first run. A bare `git-roost` scans the usual checkout
+folders under your home directory that actually exist — `~/dev`, `~/src`,
+`~/GitHub`, `~/Documents/GitHub` (GitHub Desktop), `~/code`, `~/repos`,
+`~/work`, `~/git`, `~/projects`, and Visual Studio's `~/source/repos`. If none
+of those folders exist, it scans the current directory, three levels down.
+It will not walk `$HOME` itself (too wide, too much junk).
+
+If your trees live somewhere else:
+
+```bash
+git-roost --root ~/wherever
+git-roost --root                   # this directory (omit the path)
+git-roost --root ~/dev --root ~/src
+```
+
+Keep that as the daily default with `GIT_ROOST_ROOT` (same separator as `PATH`:
+`:` on Unix, `;` on Windows):
+
+```bash
+export GIT_ROOST_ROOT=~/wherever           # bash
+$env:GIT_ROOST_ROOT = "$HOME\wherever"     # PowerShell
+```
+
+`--root` still wins for one call. Deeper trees need `--depth`.
+
 The man page installs to `<prefix>/share/man/man1`. A system or Homebrew install
 puts that on the default MANPATH; a venv or pipx install does not, so `man
 git-roost` there needs `MANPATH` help.
@@ -88,13 +119,13 @@ more than one thing is working in parallel.
 ## Usage
 
 ```bash
-git-roost                # one table, most actionable first
+git-roost                # one table; usual checkout folders, then cwd
 git-roost -1             # render once and exit (the default; --once)
 git-roost -w             # redraw every 3s (the top view)
 git-roost --log          # commit feed across every repo, newest first
 git-roost --all          # expand the QUIET group
 git-roost --json         # records, for piping somewhere else
-git-roost --root ~/src   # look somewhere other than ~/GitHub (repeatable)
+git-roost --root ~/src   # extra roots (repeatable); overrides the usual folders
 git-roost --repo wings --sort work --filter dirty   # scope, sort and filter together
 git-roost --check                      # no table -- exit 1 if any tree needs a human first
 git-roost --fail-on stuck              # like --check, but keeps the normal table
@@ -111,9 +142,15 @@ Watch mode takes keys:
 | `f` | filter: all / uncommitted / mid-operation |
 | `a` | expand or collapse `QUIET` |
 | `l` | toggle the fleet table and the commit feed, without restarting |
-| `j` / `k` | move the row cursor down / up |
+| `j` / `k` | move the row cursor; the viewport follows |
 | `enter` | open a detail view for the highlighted tree |
 | `q` | quit |
+
+`-w` is a screen, not a dump. It uses the terminal height, keeps the status
+line and `?` on screen, and `j`/`k` scroll through the rest. A one-shot
+`git-roost` still prints every tree (pipe that to `less` if you want the
+list). Watch mode also uses the alternate screen, so it does not leave 85
+rows in the scrollback.
 
 Sort cycles *within* a group and never across one. The group order is the whole
 argument this tool makes — cost of ignoring, not recency or size — so a sort
@@ -127,9 +164,10 @@ it just seeds the initial view — `git-roost --log -w` opens on the feed, and
 `git-roost -w` opens on the table — and `l` flips between the two live,
 without losing the scan already in flight.
 
-`j`/`k` move a highlighted row through whatever the table is currently
-showing — same sort, same filter, same QUIET collapse everyone else sees.
-`enter` opens a detail screen for that tree: its whole stash list rather than
+`j`/`k` move a highlighted row (`>` in the left margin) through whatever the
+table is currently showing — same sort, same filter, same QUIET collapse
+everyone else sees. The viewport follows the cursor so a fleet of eighty
+trees stays inside the terminal. `enter` opens a detail screen for that tree: its whole stash list rather than
 just a count, a diffstat of the most recent stash, what it's stuck doing if
 anything, and its last five commits. Any other key returns to the table, the
 same way dismissing the `?` overlay does — one dismissal convention, not two.
@@ -259,7 +297,7 @@ know which is authoritative, and a confident wrong baseline is worse than `-`.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `GIT_ROOST_ROOT` | `~/GitHub` | where to look for repos, `os.pathsep`-separated for more than one (same convention as `PATH`) — `--root` overrides it for one call |
+| `GIT_ROOST_ROOT` | usual checkout folders under `$HOME` that exist, else cwd | where to look for repos, `os.pathsep`-separated for more than one (same convention as `PATH`) — `--root` overrides it for one call |
 | `GIT_ROOST_TIMEOUT` | `5` | seconds any single git call may take before it is abandoned |
 | `GIT_ROOST_WORKERS` | `12` | how many trees are scanned in parallel |
 | `GIT_ROOST_GH_TIMEOUT` | `8` | seconds any single `gh` call may take before it is abandoned (only with `--github`) |
@@ -303,7 +341,10 @@ A full scan is parallel across trees, and repo-level facts (stashes, remote
 refs) are computed once per repo rather than once per worktree.
 
 Measured on 27 trees across 11 repos: **~0.68s** per redraw, comfortably inside
-the default 3s watch interval. Tunable with `GIT_ROOST_WORKERS` and
+the default 3s watch interval. A Windows box with ~85 trees is closer to
+**~8s** for a one-shot: finding the trees is cheap, each one is several
+`git.exe` spawns. A bare run prints `scanning N tree(s)...` on stderr so that
+wait is not a blank prompt. Tunable with `GIT_ROOST_WORKERS` and
 `GIT_ROOST_TIMEOUT`.
 
 ## The family

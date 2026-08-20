@@ -1,7 +1,10 @@
 # The demo recordings
 
 The GIFs are recorded against a **synthetic fleet**, not against the machine
-doing the recording. git-roost reads real repositories, so an unstaged recording
+doing the recording, and against the working copy on `PATH` (via `bin/git-roost`),
+not a released install. The first pair shipped with 0.2; re-record after any
+watch-mode change so the README does not advertise a table the current binary
+no longer draws. git-roost reads real repositories, so an unstaged recording
 would put actual repo names, branch names and commit subjects into a public GIF.
 `setup_fleet.py` builds nine invented repos and two linked worktrees under the
 system temp dir instead, with local bare repos standing in for origins so
@@ -21,14 +24,17 @@ anywhere.
 ```bash
 cd demo
 
-python3 setup_fleet.py          # stage the fleet
-vhs hero.tape                   # -> git-roost-demo.gif
-
-python3 setup_fleet.py --live 45 &   # stage, then mutate on a schedule
-vhs loop.tape                        # -> git-roost-loop.gif
+# Linux/macOS:
+python3 setup_fleet.py
+vhs hero.tape
+python3 setup_fleet.py --live 45 &
+vhs loop.tape
 wait
+python3 setup_fleet.py --clean
 
-python3 setup_fleet.py --clean  # remove /tmp/git-roost-demo
+# From Windows, WSL has vhs. Copies onto ext4 first so a CRLF shebang
+# cannot break the recording (see .gitattributes):
+#   wsl -d Ubuntu -- bash demo/record.sh
 ```
 
 `bin/git-roost` puts the working copy on `$PATH`, so the tapes record the tree
