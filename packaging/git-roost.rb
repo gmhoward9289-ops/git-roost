@@ -54,7 +54,7 @@ class GitRoost < Formula
 
   desc "top for git: every repo and worktree on the box, most actionable first"
   homepage "https://github.com/gmhoward9289-ops/git-roost"
-  version "0.3.1" # x-release-please-version
+  version "0.4.0" # x-release-please-version
   url "https://github.com/gmhoward9289-ops/git-roost/releases/download/v#{version}/git_roost-#{version}.tar.gz"
   # STALE ON PURPOSE, AND KNOWN WRONG FOR THE URL ABOVE. This digest is the one
   # for the old archive/refs/tags/ tarball; no release carrying an sdist asset
