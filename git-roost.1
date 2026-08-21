@@ -26,23 +26,24 @@ and
 .B stash pop
 are not the same kind of operation.
 .PP
-A bare run scans the usual checkout folders under the home directory that
-exist (\fB~/dev\fR, \fB~/src\fR, \fB~/GitHub\fR, \fB~/Documents/GitHub\fR,
-and similar). If none exist, it scans the current directory. It does not walk
-.B $HOME
-itself. Override with
+A bare run opens the TUI and scans the current directory. Override with
 .B \-\-root
 or
 .BR $GIT_ROOST_ROOT .
-If nothing is found, the table is replaced by the paths that were searched
-and the
+A configured root that does not exist (or is not a directory) is an error.
+If the root exists but no repositories are found within
+.BR \-\-depth ,
+the table is replaced by the paths that were searched and the
 .B \-\-root
-invocation that would scan somewhere else.
+invocation that would scan somewhere else. Use
+.B \-\-once
+(or pipe stdout) for a one\-shot table instead of the TUI.
 .SH OPTIONS
 .TP
 .BR \-w ", " \-\-watch " [\fISECS\fR]"
-Redraw every \fISECS\fR seconds, default 3. This is a viewport the size of
-the terminal, not a scrolling dump: the status line stays on screen and
+Redraw every \fISECS\fR seconds, default 3. This is the default mode on a
+TTY. It is a viewport the size of the terminal, not a scrolling dump: the
+status line stays on screen and
 \fBj\fR/\fBk\fR move a row cursor through trees that do not fit.
 .TP
 .BR \-\-log " [\fIN\fR]"
@@ -51,7 +52,8 @@ entries. Commits are deduplicated per repository, so a repo and its worktrees do
 not each contribute a copy.
 .TP
 .BR \-1 ", " \-\-once
-Render once and exit. This is the default; it overrides \fB\-\-watch\fR.
+Render once and exit. Overrides \fB\-\-watch\fR. Also used automatically when
+stdout is not a TTY (pipes and redirects).
 .TP
 .BR \-a ", " \-\-all
 Expand the collapsed QUIET group.
@@ -59,10 +61,8 @@ Expand the collapsed QUIET group.
 .BR \-\-root " \fIDIR\fR"
 Where to look for repositories. Repeatable. Default is
 .BR $GIT_ROOST_ROOT
-if set, otherwise the usual checkout folders under the home directory that
-exist, otherwise the current directory (never
-.B $HOME
-itself).
+if set, otherwise the current directory. A root that does not exist or is not
+a directory exits with status 1.
 .TP
 .BR \-\-depth " \fIN\fR"
 How deep to search below each root, default 3. Worktrees kept beside a repo live

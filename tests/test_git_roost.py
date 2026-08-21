@@ -1438,44 +1438,58 @@ class TestRootEnvVar(unittest.TestCase):
         )
         self.assertEqual([p.name for p in roots], ["one", "two"])
 
-    def test_default_roots_use_well_known_dirs_that_exist(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            (home / "dev").mkdir()
-            (home / "GitHub").mkdir()
-            roots = git_roost.default_roots(home=home, cwd=home, env="")
-            self.assertEqual({p.name for p in roots}, {"dev", "GitHub"})
-
-    def test_default_roots_do_not_walk_home(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            roots = git_roost.default_roots(home=home, cwd=home, env="")
-            self.assertEqual(roots, ())
-
-    def test_default_roots_fall_back_to_cwd(self):
+    def test_default_roots_are_the_current_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
             proj = Path(tmp) / "proj"
             home.mkdir()
             proj.mkdir()
+            (home / "dev").mkdir()
             roots = git_roost.default_roots(home=home, cwd=proj, env="")
             self.assertEqual(list(roots), [proj])
 
-    def test_empty_fleet_with_no_roots_lists_usual_places(self):
+    def test_default_roots_use_cwd_even_when_home_has_dev(self):
+        # Well-known ~/dev folders are no longer scanned by a bare run.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            text = "\n".join(git_roost.empty_fleet_lines((), home=home, cwd=home))
-            self.assertIn("usual checkout folders", text)
-            self.assertIn("home directory is too wide", text)
-            self.assertIn(str(home / "dev"), text)
-            self.assertIn(str(home / "GitHub"), text)
+            (home / "dev").mkdir()
+            roots = git_roost.default_roots(home=home, cwd=home, env="")
+            self.assertEqual(list(roots), [home])
+
+    def test_empty_fleet_with_no_roots_points_at_cwd_and_env(self):
+        text = "\n".join(git_roost.empty_fleet_lines(()))
+        self.assertIn("current directory", text)
+        self.assertIn("GIT_ROOST_ROOT", text)
+        self.assertIn("--root", text)
+
+    def test_missing_root_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "nope")
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = git_roost.main(["--root", missing])
+            self.assertEqual(rc, 1)
+            self.assertIn("does not exist", err.getvalue())
+            self.assertIn(missing, err.getvalue())
+
+    def test_root_that_is_a_file_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "not-a-dir"
+            path.write_text("x\n", encoding="utf-8")
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = git_roost.main(["--root", str(path)])
+            self.assertEqual(rc, 1)
+            self.assertIn("not a directory", err.getvalue())
 
     @needs_git
-    def test_bare_run_finds_a_repo_in_home_dev(self):
+    def test_bare_run_finds_a_repo_in_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            make_repo(home / "dev" / "alpha")
-            roots = git_roost.default_roots(home=home, cwd=home, env="")
+            home = Path(tmp) / "home"
+            proj = Path(tmp) / "proj"
+            home.mkdir()
+            make_repo(proj / "alpha")
+            roots = git_roost.default_roots(home=home, cwd=proj, env="")
             found = {p.name for p in git_roost.discover(roots, depth=3)}
             self.assertEqual(found, {"alpha"})
 

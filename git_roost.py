@@ -11,9 +11,9 @@ answer a question about thirty trees at once, which is exactly the question you
 have when a dozen agents are working in parallel: who is diverged, who has
 uncommitted work nobody has looked at, who is stuck mid-rebase.
 
-    git-roost                # one table; usual checkout folders, then cwd
+    git-roost                # TUI; current directory is the scan root
     git-roost --root ~/dev   # scan a specific tree of checkouts
-    git-roost -w             # redraw every 3s (the top view)
+    git-roost -1             # render once and exit
     git-roost --log          # commit feed across every repo, newest first
     git-roost --all          # expand the QUIET group
     git-roost --json         # records, for piping somewhere else
@@ -21,11 +21,11 @@ uncommitted work nobody has looked at, who is stuck mid-rebase.
     git-roost --check        # exit 1 if anything needs a human first; for hooks
     git-roost --github       # add a PR/CI column, via `gh` (opt-in, network)
 
-Watch mode takes keys -- `?` for the map, `r` refresh, `s` sort, `f` filter, `a`
-quiet, `l` toggles the table for the commit feed, `j`/`k` move a row cursor,
-`enter` opens a detail view for the highlighted tree, `q` quit. The default
-one-shot render takes none and touches no terminal settings at all, which is
-what keeps it safe to pipe.
+Watch mode (the default on a TTY) takes keys -- `?` for the map, `r` refresh,
+`s` sort, `f` filter, `a` quiet, `l` toggles the table for the commit feed,
+`j`/`k` move a row cursor, `enter` opens a detail view for the highlighted
+tree, `q` quit. `--once` / pipes / `--json` take no keys and touch no terminal
+settings, which is what keeps them safe to script.
 
 One file, no dependencies, Python 3.9+, macOS/Linux/Windows -- the same
 constraints as roost, for the same reason: it has to run on whatever Python is
@@ -84,30 +84,13 @@ except ImportError:
 __version__ = "0.4.2"
 # x-release-please-end
 
-HOME = Path.home()
-
-# Folders people actually keep checkouts in, relative to $HOME. A bare
-# `git-roost` after install walks whichever of these exist -- not a single
-# path that happens to be true on one author's machine. GIT_ROOST_ROOT
-# (os.pathsep-separated, same convention as PATH) and --root still override.
-WELL_KNOWN_RELATIVE = (
-    Path("GitHub"),
-    Path("dev"),
-    Path("src"),
-    Path("code"),
-    Path("projects"),
-    Path("Projects"),
-    Path("repos"),
-    Path("work"),
-    Path("git"),
-    Path("Documents") / "GitHub",  # GitHub Desktop on Windows/macOS
-    Path("source") / "repos",      # Visual Studio
-)
-
 # How deep to look for a repo below a root. Worktrees live at
 # <root>/.worktrees/<repo>/<slug>, which is depth 3, so 3 is the floor and the
 # default. Deeper costs a directory walk and finds mostly vendored junk.
 DEFAULT_DEPTH = 3
+
+# Watch-mode redraw interval when a bare `git-roost` opens the TUI.
+DEFAULT_WATCH = 3.0
 
 # Never descend into these. A node_modules with its own .git is not a repo you
 # are working in, and walking one costs more than the whole rest of the scan.
@@ -729,52 +712,28 @@ def visible_rows(states, expand_quiet=False, sort_mode="recent", filt="all"):
     return [s for s in rows if bucket(s)[1] != "QUIET" or expand_quiet]
 
 
-def well_known_root_paths(home=None):
-    home = Path(home or HOME)
-    return [home / rel for rel in WELL_KNOWN_RELATIVE]
-
-
 def default_roots(home=None, cwd=None, env=None):
     """Where a bare `git-roost` looks, computed at scan time.
 
-    1. GIT_ROOST_ROOT, if set.
-    2. Every well-known checkout folder under $HOME that exists.
-    3. Otherwise the current directory, unless that *is* $HOME -- walking a
-       whole homedir is slow and picks up AppData / Library junk.
+    1. GIT_ROOST_ROOT, if set (os.pathsep-separated, same convention as PATH).
+    2. Otherwise the current directory.
+
+    `home` is accepted for call-site compatibility with older tests; a bare
+    run no longer walks well-known folders under $HOME.
     """
+    _ = home
     if env is None:
         env = os.environ.get("GIT_ROOST_ROOT")
     if env:
         return tuple(Path(p).expanduser() for p in env.split(os.pathsep) if p)
-    home = Path(home or HOME)
     if cwd is None:
         try:
             cwd = Path.cwd()
         except OSError:
-            cwd = home
+            return ()
     else:
         cwd = Path(cwd)
-    found = []
-    seen = set()
-    for path in well_known_root_paths(home):
-        try:
-            if not path.is_dir():
-                continue
-            key = str(path.resolve())
-        except OSError:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        found.append(path)
-    if found:
-        return tuple(found)
-    try:
-        if cwd.is_dir() and cwd.resolve() != home.resolve():
-            return (cwd,)
-    except OSError:
-        pass
-    return ()
+    return (cwd,)
 
 
 def resolved_roots(args, home=None, cwd=None):
@@ -784,21 +743,36 @@ def resolved_roots(args, home=None, cwd=None):
     return list(default_roots(home=home, cwd=cwd))
 
 
+def root_problems(roots):
+    """(path, reason) for each root that is missing or not a directory.
+
+    A bare run treats the current directory as the root and must fail loudly
+    when a configured root is gone -- silent skip used to look like an empty
+    fleet.
+    """
+    problems = []
+    for raw in roots:
+        path = Path(raw).expanduser()
+        try:
+            exists = path.exists()
+        except OSError as exc:
+            problems.append((path, str(exc)))
+            continue
+        if not exists:
+            problems.append((path, "does not exist"))
+        elif not path.is_dir():
+            problems.append((path, "not a directory"))
+    return problems
+
+
 def empty_fleet_lines(roots, depth=DEFAULT_DEPTH, home=None, cwd=None):
     """What a first run prints when the scan found nothing.
 
-    Name what was searched, and the two ways to point the next run at a
-    folder of checkouts. A missing ~/GitHub used to be the whole story;
-    most installs keep trees in ~/dev or ~/src instead.
+    Name what was searched, and the ways to point the next run at a folder of
+    checkouts. Missing roots are reported by root_problems() before a scan;
+    this path is the "root exists, no repos within depth" case.
     """
-    home = Path(home or HOME)
-    if cwd is None:
-        try:
-            cwd = Path.cwd()
-        except OSError:
-            cwd = home
-    else:
-        cwd = Path(cwd)
+    _ = home, cwd
     lines = ["no git repositories found", ""]
     if roots:
         lines.append("looked under (depth %d):" % depth)
@@ -814,18 +788,10 @@ def empty_fleet_lines(roots, depth=DEFAULT_DEPTH, home=None, cwd=None):
         lines.append("")
         lines.append("Point git-roost at a folder of checkouts:")
     else:
-        lines.append("A bare git-roost looks in the usual checkout folders")
-        lines.append("under your home directory. None of those exist yet:")
-        for path in well_known_root_paths(home):
-            lines.append("  %s" % path)
+        lines.append("No scan root was resolved.")
+        lines.append("A bare git-roost uses the current directory;")
+        lines.append("pass --root or set GIT_ROOST_ROOT to choose another.")
         lines.append("")
-        try:
-            if cwd.resolve() == home.resolve():
-                lines.append(
-                    "Did not walk %s -- a home directory is too wide." % cwd)
-                lines.append("")
-        except OSError:
-            pass
         lines.append("Point git-roost at a folder of checkouts:")
     lines.extend([
         "",
@@ -1788,10 +1754,10 @@ def main(argv=None):
         prog="git-roost",
         description=(
             "top for git -- every repo and worktree, most actionable first.\n\n"
-            "Bare run scans the usual checkout folders under your home directory\n"
-            "(~/dev, ~/src, ~/GitHub, ~/Documents/GitHub, ...) that exist. If none\n"
-            "do, it scans the current directory -- unless that is $HOME, which is\n"
-            "too wide. Pass --root DIR or set GIT_ROOST_ROOT to choose."
+            "Bare run opens the TUI and scans the current directory. Pass\n"
+            "--root DIR or set GIT_ROOST_ROOT to choose another tree. A root\n"
+            "that does not exist is an error. Use --once (or pipe stdout) for\n"
+            "a one-shot table."
         ),
         epilog=("watch-mode keys:  " + "  ".join(
             "%s %s" % (k, d.split(":")[0].split("(")[0].strip())
@@ -1799,18 +1765,22 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--version", action="version", version="git-roost %s" % __version__)
-    ap.add_argument("-w", "--watch", nargs="?", const=3.0, type=float, metavar="SECS",
-                    help="redraw every SECS seconds (default 3); takes keys, see below")
+    ap.add_argument("-w", "--watch", nargs="?", const=DEFAULT_WATCH, type=float,
+                    default=DEFAULT_WATCH, metavar="SECS",
+                    help="redraw every SECS seconds (default %.0f; this is the "
+                         "default mode on a TTY); takes keys, see below"
+                         % DEFAULT_WATCH)
     ap.add_argument("-1", "--once", action="store_true",
-                    help="render once and exit (the default; overrides --watch)")
+                    help="render once and exit (overrides --watch; also used "
+                         "when stdout is not a TTY)")
     ap.add_argument("--log", nargs="?", const=25, type=int, metavar="N",
                     help="commit feed across every repo, newest first (default 25)")
     ap.add_argument("-a", "--all", action="store_true", help="expand the QUIET group")
     ap.add_argument("--root", action="append", nargs="?", const=".", metavar="DIR",
                     help="where to look for repos (repeatable; omit DIR to "
                          "mean the current directory. Default with no --root: "
-                         "$GIT_ROOST_ROOT, else the usual checkout folders "
-                         "under $HOME that exist, else the current directory)")
+                         "$GIT_ROOST_ROOT if set, else the current directory. "
+                         "Missing roots are an error)")
     ap.add_argument("--depth", type=int, default=DEFAULT_DEPTH, metavar="N",
                     help="how deep to search below each root (default %d)" % DEFAULT_DEPTH)
     ap.add_argument("--repo", action="append", metavar="NAME",
@@ -1840,8 +1810,15 @@ def main(argv=None):
     ap.add_argument("--github-interval", type=float, default=30.0, metavar="SECS",
                     help="in watch mode, refresh PR/CI data at most every SECS "
                          "seconds rather than every redraw (default 30); no "
-                         "effect outside -w or without --github")
+                         "effect outside watch mode or without --github")
     args = ap.parse_args(argv)
+
+    # TUI is the default on a real terminal. Scripts, pipes, --once and --json
+    # stay one-shot so `git-roost | less` and the test harness never hang in
+    # the watch loop. Clearing watch keeps scan()'s oneshot progress check
+    # honest -- it keys off args.watch being unset.
+    if args.once or args.json or not sys.stdout.isatty():
+        args.watch = None
 
     # Escape sequences need a real terminal that understands them. This gates
     # the watch loop's cursor-home and erase as well as colour: on a Windows
@@ -1856,6 +1833,12 @@ def main(argv=None):
     COLOR = ansi and not args.no_color and not os.environ.get("NO_COLOR")
     if args.json:
         COLOR = False
+
+    problems = root_problems(resolved_roots(args))
+    if problems:
+        for path, reason in problems:
+            sys.stderr.write("git-roost: root %s: %s\n" % (path, reason))
+        return 1
 
     if args.check:
         # A scripted gate, not a view of the table: watch mode and --filter
@@ -1874,7 +1857,7 @@ def main(argv=None):
             print("\n".join(render(offenders, width, filt="all")))
         return 1 if offenders else 0
 
-    if args.once or not args.watch:
+    if not args.watch:
         width = shutil.get_terminal_size((160, 24)).columns
         lines, states = body(args, width)
         print("\n".join(lines))

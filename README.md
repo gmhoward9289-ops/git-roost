@@ -79,12 +79,9 @@ Then run it:
 git-roost
 ```
 
-That is the whole first run. A bare `git-roost` scans the usual checkout
-folders under your home directory that actually exist — `~/dev`, `~/src`,
-`~/GitHub`, `~/Documents/GitHub` (GitHub Desktop), `~/code`, `~/repos`,
-`~/work`, `~/git`, `~/projects`, and Visual Studio's `~/source/repos`. If none
-of those folders exist, it scans the current directory, three levels down.
-It will not walk `$HOME` itself (too wide, too much junk).
+That is the whole first run. A bare `git-roost` opens the TUI and scans the
+current directory, three levels down. A root that does not exist is an error
+(exit 1), not a quiet empty table.
 
 If your trees live somewhere else:
 
@@ -102,7 +99,8 @@ export GIT_ROOST_ROOT=~/wherever           # bash
 $env:GIT_ROOST_ROOT = "$HOME\wherever"     # PowerShell
 ```
 
-`--root` still wins for one call. Deeper trees need `--depth`.
+`--root` still wins for one call. Deeper trees need `--depth`. Use `-1` /
+`--once` (or pipe stdout) for a one-shot table instead of the TUI.
 
 The man page installs to `<prefix>/share/man/man1`. A system or Homebrew install
 puts that on the default MANPATH; a venv or pipx install does not, so `man
@@ -119,13 +117,13 @@ more than one thing is working in parallel.
 ## Usage
 
 ```bash
-git-roost                # one table; usual checkout folders, then cwd
-git-roost -1             # render once and exit (the default; --once)
-git-roost -w             # redraw every 3s (the top view)
+git-roost                # TUI; current directory is the scan root
+git-roost -1             # render once and exit (--once; also used when piped)
+git-roost -w 5           # redraw every 5s (watch is already the default)
 git-roost --log          # commit feed across every repo, newest first
 git-roost --all          # expand the QUIET group
 git-roost --json         # records, for piping somewhere else
-git-roost --root ~/src   # extra roots (repeatable); overrides the usual folders
+git-roost --root ~/src   # scan somewhere else (repeatable)
 git-roost --repo wings --sort work --filter dirty   # scope, sort and filter together
 git-roost --check                      # no table -- exit 1 if any tree needs a human first
 git-roost --fail-on stuck              # like --check, but keeps the normal table
@@ -146,11 +144,11 @@ Watch mode takes keys:
 | `enter` | open a detail view for the highlighted tree |
 | `q` | quit |
 
-`-w` is a screen, not a dump. It uses the terminal height, keeps the status
-line and `?` on screen, and `j`/`k` scroll through the rest. A one-shot
-`git-roost` still prints every tree (pipe that to `less` if you want the
-list). Watch mode also uses the alternate screen, so it does not leave 85
-rows in the scrollback.
+`-w` is a screen, not a dump — and it is the default on a TTY. It uses the
+terminal height, keeps the status line and `?` on screen, and `j`/`k` scroll
+through the rest. A one-shot `git-roost -1` still prints every tree (pipe that
+to `less` if you want the list). Watch mode also uses the alternate screen, so
+it does not leave 85 rows in the scrollback.
 
 Sort cycles *within* a group and never across one. The group order is the whole
 argument this tool makes — cost of ignoring, not recency or size — so a sort
@@ -184,10 +182,11 @@ dirty --json` is one repo's uncommitted trees, nothing else. Both also seed
 `-w`'s starting view, so `-w --sort work --filter dirty` opens watch mode
 already positioned there and the keys still cycle from it.
 
-Keys need a terminal. Piped, redirected, or on a box with neither `termios` nor
-`msvcrt`, watch mode degrades to the plain timer redraw rather than failing, and
-the default one-shot render touches no terminal settings at all — which is what
-keeps `git-roost | less` and `git-roost --json | jq` safe.
+Keys need a terminal. Piped, redirected, or with `--once` / `--json`, the
+tool stays one-shot and touches no terminal settings — which is what keeps
+`git-roost | less` and `git-roost --json | jq` safe. On a TTY the default is
+the watch TUI; on a box with neither `termios` nor `msvcrt`, watch mode
+degrades to the plain timer redraw rather than failing.
 
 Two exit-code flags, for two different hook shapes:
 
@@ -297,7 +296,7 @@ know which is authoritative, and a confident wrong baseline is worse than `-`.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `GIT_ROOST_ROOT` | usual checkout folders under `$HOME` that exist, else cwd | where to look for repos, `os.pathsep`-separated for more than one (same convention as `PATH`) — `--root` overrides it for one call |
+| `GIT_ROOST_ROOT` | current directory | where to look for repos, `os.pathsep`-separated for more than one (same convention as `PATH`) — `--root` overrides it for one call; missing roots exit 1 |
 | `GIT_ROOST_TIMEOUT` | `5` | seconds any single git call may take before it is abandoned |
 | `GIT_ROOST_WORKERS` | `12` | how many trees are scanned in parallel |
 | `GIT_ROOST_GH_TIMEOUT` | `8` | seconds any single `gh` call may take before it is abandoned (only with `--github`) |
