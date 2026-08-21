@@ -81,7 +81,7 @@ except ImportError:
 # Three components, not two: release-please parses strict semver and throws
 # on "0.1", and npm rejects it outright. The historical v0.1 tag stands.
 # x-release-please-start-version
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 # x-release-please-end
 
 HOME = Path.home()
