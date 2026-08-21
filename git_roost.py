@@ -1604,12 +1604,11 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
     frame = [status_line(
         view["sort"], view["filter"], view["quiet"], args.watch,
         view_mode, loading=loading)] + list(out)
-    if ansi:
-        write_tty_frame(width, height, frame)
-    else:
-        sys.stdout.write("\n" + "-" * min(width, 78) + "\n")
-        sys.stdout.write("\n".join(frame) + "\n")
-        sys.stdout.flush()
+    # Watch only runs when ansi is on (see main). The old "print another
+    # separator + frame" else branch is what flooded a non-VT cmd every 3s.
+    if not ansi:
+        raise RuntimeError("draw_watch_frame requires a VT-capable console")
+    write_tty_frame(width, height, frame)
     return shown
 
 
@@ -1823,9 +1822,16 @@ def main(argv=None):
     # Escape sequences need a real terminal that understands them. This gates
     # the watch loop's cursor-home and erase as well as colour: on a Windows
     # console without VT processing those two are ignored rather than obeyed, so
-    # every frame appends below the last and the screen pages away instead of
-    # redrawing. Piping to a file has the same problem in a different form.
+    # every frame would append below the last and the screen pages away instead
+    # of redrawing. That is exactly the "spamming my cmd" failure -- so watch
+    # refuses to run without VT and falls back to one shot, rather than looping
+    # a dump. Piping to a file has the same problem in a different form.
     ansi = sys.stdout.isatty() and enable_windows_ansi()
+    if args.watch and not ansi:
+        sys.stderr.write(
+            "git-roost: no VT console (cannot redraw in place); "
+            "rendering once. Use Windows Terminal, or pass --once.\n")
+        args.watch = None
 
     # NO_COLOR is the community convention (https://no-color.org) and costs
     # nothing to honour. It suppresses colour only -- a user who wants plain
