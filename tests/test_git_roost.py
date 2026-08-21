@@ -13,6 +13,7 @@ loop across every repo on the machine; the guarantee that it cannot write is the
 only thing making that safe, so it is asserted rather than assumed.
 """
 
+import argparse
 import importlib.util
 import io
 import json
@@ -22,7 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
-import unittest.mock
+from unittest import mock
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
@@ -1124,6 +1125,31 @@ class TestCli(unittest.TestCase):
         with self.assertRaises(SystemExit):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 git_roost.main(["--sort", "bogus"])
+
+    def test_watch_without_vt_falls_back_to_once_instead_of_spamming(self):
+        # Non-VT Windows consoles used to append a full frame every interval
+        # (the "spamming my cmd" bug). Watch must refuse and render once.
+        with tempfile.TemporaryDirectory() as tmp:
+            out, err = io.StringIO(), io.StringIO()
+            # Patch *after* redirect so isatty lands on the capture stream,
+            # not the original stdout that redirect replaces.
+            with redirect_stdout(out), redirect_stderr(err), \
+                 mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(git_roost, "enable_windows_ansi",
+                                   return_value=False):
+                rc = git_roost.main(["--root", tmp, "-w", "0.01"])
+            self.assertEqual(rc, 0)
+            self.assertIn("no VT console", err.getvalue())
+            self.assertIn("no git repositories found", out.getvalue())
+            self.assertNotIn("\n---", out.getvalue())
+
+    def test_draw_watch_frame_refuses_a_non_vt_console(self):
+        args = argparse.Namespace(watch=3.0, json=False, github=False)
+        view = {"sort": "recent", "filter": "all", "quiet": False,
+                "log": False, "cursor": 0, "detail": None}
+        with self.assertRaises(RuntimeError):
+            git_roost.draw_watch_frame(
+                False, 80, 24, view, args, False, [], {})
 
 
 class TestExitCode(unittest.TestCase):
