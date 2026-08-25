@@ -165,13 +165,14 @@ jobs:
       - name: Every git/gh call goes through a read-only wrapper
         run: |
           set -euo pipefail
-          # Exactly two subprocess.run in the file: the one inside git(), and
-          # the one inside gh_call(). Not "at least two" -- a third guarded
-          # path is still a new invocation surface this check exists to make
-          # a reviewer look at, not something to wave through silently.
+          # Exactly three subprocess.run in the file: one inside git(), one
+          # inside gh_call(), and one in to_clipboard() for explicit operator
+          # clipboard copies. Not "at least three" -- a fourth guarded path is
+          # still a new invocation surface this check exists to make a reviewer
+          # look at, not something to wave through silently.
           n=$(grep -c 'subprocess\.run' git_roost.py)
-          if [ "$n" -ne 2 ]; then
-            echo "::error::expected exactly 2 subprocess.run calls (git() and gh_call()), found $n"
+          if [ "$n" -ne 3 ]; then
+            echo "::error::expected exactly 3 subprocess.run calls (git(), gh_call(), to_clipboard()), found $n"
             grep -n 'subprocess\.run' git_roost.py
             exit 1
           fi
