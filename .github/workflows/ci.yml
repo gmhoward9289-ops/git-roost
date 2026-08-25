@@ -165,13 +165,15 @@ jobs:
       - name: Every git/gh call goes through a read-only wrapper
         run: |
           set -euo pipefail
-          # Exactly two subprocess.run in the file: the one inside git(), and
-          # the one inside gh_call(). Not "at least two" -- a third guarded
-          # path is still a new invocation surface this check exists to make
-          # a reviewer look at, not something to wave through silently.
+          # Exactly three subprocess.run in the file: the one inside git(),
+          # the one inside gh_call(), and the clipboard spawn inside
+          # to_clipboard() (watch mode's `y` -- clip/pbcopy/xclip, never git
+          # or gh, asserted below). Not "at least" -- a fourth path is still
+          # a new invocation surface this check exists to make a reviewer
+          # look at, not something to wave through silently.
           n=$(grep -c 'subprocess\.run' git_roost.py)
-          if [ "$n" -ne 2 ]; then
-            echo "::error::expected exactly 2 subprocess.run calls (git() and gh_call()), found $n"
+          if [ "$n" -ne 3 ]; then
+            echo "::error::expected exactly 3 subprocess.run calls (git(), gh_call(), to_clipboard()), found $n"
             grep -n 'subprocess\.run' git_roost.py
             exit 1
           fi
@@ -198,12 +200,22 @@ jobs:
             echo "::error::gh_call()'s subprocess.run is no longer guarded by check_gh_read_only()"
             exit 1
           fi
+          # The clipboard spawn must stay what it is -- a fixed set of
+          # clipboard helpers. A git or gh invocation smuggled through it
+          # would bypass both allowlists. The pattern is a *quoted* bare
+          # git/gh -- the only spelling that can reach an argv -- because
+          # extract() runs to the next top-level def, and prose mentions of
+          # git-roost in the docstrings it sweeps up are not invocations.
+          if extract to_clipboard | grep -nE "[\"'](git|gh)(\.exe)?[\"']"; then
+            echo "::error::to_clipboard() must not invoke git or gh"
+            exit 1
+          fi
           # And nothing may shell out to git or gh any other way.
           if grep -nE 'os\.(system|popen)|subprocess\.(call|check_output|Popen|check_call)' git_roost.py; then
             echo "::error::git/gh must only be invoked through git()/gh_call(), which enforce READ_ONLY"
             exit 1
           fi
-          echo "two guarded invocation paths (git, gh), as designed"
+          echo "two guarded invocation paths (git, gh) plus the clipboard spawn, as designed"
 
   semgrep:
     runs-on: ubuntu-latest

@@ -21,11 +21,13 @@ uncommitted work nobody has looked at, who is stuck mid-rebase.
     git-roost --check        # exit 1 if anything needs a human first; for hooks
     git-roost --github       # add a PR/CI column, via `gh` (opt-in, network)
 
-Watch mode (the default on a TTY) takes keys -- `?` for the map, `r` refresh,
-`s` sort, `f` filter, `a` quiet, `l` toggles the table for the commit feed,
-`j`/`k` move a row cursor, `enter` opens a detail view for the highlighted
-tree, `q` quit. `--once` / pipes / `--json` take no keys and touch no terminal
-settings, which is what keeps them safe to script.
+Watch mode (the default on a TTY) takes keys -- `?` for the map and how to
+read the table, `r` refresh, `s` sort, `f` filter, `a` quiet, `l` toggles the
+table for the commit feed, `g` toggles the PR/CI column, `j`/`k` (or the
+arrows, with pgup/pgdn/home/end) move a row cursor, `y` copies the highlighted
+tree's path, `enter` opens a detail view for the highlighted tree, `q` quit.
+`--once` / pipes / `--json` take no keys and touch no terminal settings, which
+is what keeps them safe to script.
 
 One file, no dependencies, Python 3.9+, macOS/Linux/Windows -- the same
 constraints as roost, for the same reason: it has to run on whatever Python is
@@ -1381,6 +1383,20 @@ GITHUB_COLUMN = ("PR", github_cell)
 
 # ------------------------------------------------------------------- watch keys
 
+# Navigation keys arrive differently per platform -- a prefix plus scan code
+# from msvcrt, an ESC sequence from a POSIX terminal -- and both readers fold
+# them into the same symbolic names, so apply_key() has exactly one spelling
+# of "down" to bind. Module-level so the test suite can assert every name the
+# readers can emit is a name apply_key() handles.
+WIN_NAV_KEYS = {
+    "H": "up", "P": "down", "G": "home", "O": "end", "I": "pgup", "Q": "pgdn",
+}
+ANSI_NAV_KEYS = {
+    b"[A": "up", b"[B": "down", b"[H": "home", b"[F": "end",
+    b"[1~": "home", b"[4~": "end", b"[5~": "pgup", b"[6~": "pgdn",
+    b"OA": "up", b"OB": "down", b"OH": "home", b"OF": "end",
+}
+
 KEYMAP = (
     ("?", "this map"),
     ("r", "refresh now"),
@@ -1388,11 +1404,60 @@ KEYMAP = (
     ("f", "filter: all / uncommitted / mid-operation"),
     ("a", "expand or collapse QUIET"),
     ("l", "toggle table / commit feed"),
-    ("j", "move the cursor down (scrolls the viewport)"),
-    ("k", "move the cursor up (scrolls the viewport)"),
+    ("g", "toggle the PR/CI column (needs gh; network calls)"),
+    ("j", "move the cursor down (also down-arrow; scrolls the viewport)"),
+    ("k", "move the cursor up (also up-arrow; scrolls the viewport)"),
+    ("pgup", "move the cursor a page up (pgdn: a page down)"),
+    ("home", "jump the cursor to the first row (end: the last)"),
+    ("y", "copy the highlighted tree's path to the clipboard"),
     ("enter", "open a detail view for the highlighted tree"),
     ("q", "quit"),
 )
+
+# What `?` explains beyond the keys: how to read the table itself. The same
+# content as the README's "Reading the table" section, on-screen, because the
+# moment someone needs it is mid-watch, not mid-README.
+DISPLAY_HELP = (
+    ("MID-OPERATION", "stuck in a rebase/merge/cherry-pick/revert/bisect; blocking someone now"),
+    ("DIVERGED", "ahead and behind its base; will cost a conflict later"),
+    ("UNCOMMITTED", "tracked changes not yet committed"),
+    ("UNPUSHED", "ahead of its base only"),
+    ("BEHIND", "behind its base only"),
+    ("ACTIVE", "committed within the last hour"),
+    ("QUIET", "in sync and idle; collapsed to one line unless expanded (a)"),
+    ("WORK", "tracked changes, +N? untracked (12+3? = 12 tracked, 3 untracked)"),
+    ("DRIFT", "vs base: = in sync, ^2 ahead, v3 behind, ^2v3 diverged, - unknown"),
+    ("STASH", "stash count for the repo"),
+    ("@sha", "detached HEAD; commits here land on no branch"),
+    ("*", "row changed since the last frame   >  cursor row"),
+)
+
+
+def to_clipboard(text):
+    """Best-effort copy. True on success -- watch mode reports, never raises.
+
+    Read-only stays true in the sense that matters: nothing here touches a
+    repository. The clipboard is the operator's, and `y` is an explicit ask.
+    """
+    if sys.platform == "win32":
+        candidates = (("clip",),)
+    elif sys.platform == "darwin":
+        candidates = (("pbcopy",),)
+    else:
+        candidates = (("wl-copy",), ("xclip", "-selection", "clipboard"),
+                      ("xsel", "--clipboard", "--input"))
+    for cmd in candidates:
+        exe = shutil.which(cmd[0])
+        if not exe:
+            continue
+        try:
+            out = subprocess.run((exe,) + cmd[1:], input=text, text=True,
+                                 capture_output=True, timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if out.returncode == 0:
+            return True
+    return False
 
 
 class Keys:
@@ -1462,11 +1527,13 @@ class Keys:
                     ch = msvcrt.getwch()
                     if ch in ("\x00", "\xe0"):
                         # Function and arrow keys arrive as a prefix plus a
-                        # scan code. Swallow the second half, or an arrow key
-                        # reads as whatever letter shares its code -- Up is
-                        # 'H', which is nothing here today but would silently
-                        # become a hotkey the moment one is added.
-                        msvcrt.getwch()
+                        # scan code. Map the ones the keymap binds to symbolic
+                        # names; anything else is swallowed whole, or an arrow
+                        # key would read as whatever letter shares its code --
+                        # Up is 'H', which must never leak through as a hotkey.
+                        mapped = WIN_NAV_KEYS.get(msvcrt.getwch())
+                        if mapped:
+                            return mapped
                         continue
                     return ch
                 remaining = deadline - time.time()
@@ -1477,15 +1544,40 @@ class Keys:
         if not r:
             return None
         try:
-            return os.read(self._fd, 1).decode("utf-8", "replace")
+            ch = os.read(self._fd, 1)
         except OSError:
             return None
+        if ch != b"\x1b":
+            return ch.decode("utf-8", "replace")
+        # An escape sequence: the rest of it is already in the buffer (or
+        # arrives within a few ms). Collect what is there and map the
+        # sequences the keymap binds; a bare ESC or an unrecognised sequence
+        # is dropped rather than leaking bytes like '[' and 'A' as keys.
+        seq = b""
+        try:
+            while len(seq) < 8 and select.select([self._fd], [], [], 0.02)[0]:
+                more = os.read(self._fd, 1)
+                if not more:
+                    break
+                seq += more
+                if seq in ANSI_NAV_KEYS:
+                    break
+        except OSError:
+            return None
+        return ANSI_NAV_KEYS.get(seq)
 
 
 def help_lines():
     width = max(len(k) for k, _ in KEYMAP)
     out = [c("KEYS", BOLD), ""]
     out += ["  %s   %s" % (c(k.ljust(width), BOLD), desc) for k, desc in KEYMAP]
+    # The second half answers "what am I looking at", not "what can I press".
+    # Groups are listed top-to-bottom in table order -- by the cost of
+    # ignoring them -- so the overlay reads the same way the table does.
+    d_width = max(len(k) for k, _ in DISPLAY_HELP)
+    out += ["", c("READING THE TABLE", BOLD), ""]
+    out += ["  %s   %s" % (c(k.ljust(d_width), BOLD), desc)
+            for k, desc in DISPLAY_HELP]
     out += ["", c("any other key returns to the table", DIM)]
     return out
 
@@ -1515,27 +1607,64 @@ def apply_key(view, key, shown=None):
         view["sort"] = SORT_MODES[
             (SORT_MODES.index(view["sort"]) + 1) % len(SORT_MODES)]
         view["cursor"] = 0
+        view["note"] = "sort: %s" % view["sort"]
     elif key in ("f", "F"):
         view["filter"] = FILTER_MODES[
             (FILTER_MODES.index(view["filter"]) + 1) % len(FILTER_MODES)]
         view["cursor"] = 0
+        view["note"] = "filter: %s" % FILTER_LABELS[view["filter"]]
     elif key in ("a", "A"):
         view["quiet"] = not view["quiet"]
         view["cursor"] = 0
+        view["note"] = "quiet: %s" % ("shown" if view["quiet"] else "collapsed")
     elif key in ("l", "L"):
         view["log"] = not view["log"]
         view["cursor"] = 0
-    elif key in ("j", "J"):
+        view["note"] = "view: %s" % ("commit feed" if view["log"] else "table")
+    elif key in ("g", "G"):
+        # Same live-flip treatment `l` got: --github stops being launch-only.
+        # With no `gh` on the box the toggle would only ever paint a blank
+        # column, so refuse with the reason instead of half-working.
+        if GH_PATH is None:
+            view["note"] = "gh not found on PATH; PR/CI column unavailable"
+        else:
+            view["github"] = not view.get("github", False)
+            view["note"] = "PR/CI column: %s" % (
+                "on" if view["github"] else "off")
+    elif key in ("j", "J", "down"):
         # Sort, filter or the quiet toggle can shrink the shown set out from
         # under a cursor sitting near the bottom -- clamp every time rather
         # than trusting the value left over from a wider frame.
         if shown:
             last = len(shown) - 1
             view["cursor"] = min(max(0, view.get("cursor", 0)) + 1, last)
-    elif key in ("k", "K"):
+    elif key in ("k", "K", "up"):
         if shown:
             last = len(shown) - 1
             view["cursor"] = max(0, min(view.get("cursor", 0), last) - 1)
+    elif key in ("pgdn", "pgup"):
+        # A page is the viewport the watch loop last drew (view["page"]),
+        # not a constant -- paging by 10 on a 50-row terminal is a walk.
+        if shown:
+            last = len(shown) - 1
+            step = max(1, view.get("page") or 10)
+            at = max(0, min(view.get("cursor", 0), last))
+            view["cursor"] = (min(at + step, last) if key == "pgdn"
+                              else max(at - step, 0))
+    elif key == "home":
+        if shown:
+            view["cursor"] = 0
+    elif key == "end":
+        if shown:
+            view["cursor"] = len(shown) - 1
+    elif key in ("y", "Y"):
+        if shown:
+            cursor = max(0, min(view.get("cursor", 0), len(shown) - 1))
+            path = shown[cursor]["path"]
+            if to_clipboard(path):
+                view["note"] = "copied: %s" % path
+            else:
+                view["note"] = "no clipboard helper found; could not copy"
     elif key in ("\r", "\n", "enter"):
         if shown:
             cursor = max(0, min(view.get("cursor", 0), len(shown) - 1))
@@ -1548,7 +1677,7 @@ def apply_key(view, key, shown=None):
 
 
 def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table",
-                loading=None):
+                loading=None, note=None):
     """The one line that says what view you are looking at.
 
     Without it a filtered table is indistinguishable from a fleet that happens
@@ -1556,10 +1685,16 @@ def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table",
     `view_mode` is "table", "log" or "detail" -- `l` and `enter` change what is
     on screen independently of sort/filter/quiet, so it needs saying too.
     `loading` is the watch-mode spinner ("scanning 12/92 |") while collect()
-    is still in flight -- None once the frame is complete.
+    is still in flight -- None once the frame is complete. `note` is the
+    transient confirmation of the last handled key ("sort: repo", "copied:
+    ..."), shown for one redraw interval so a keypress visibly registered.
+
+    The version rides along because watch mode is where "which git-roost is
+    this box running" actually gets asked -- mid-session, not at a prompt
+    where --version is available.
     """
     bits = [
-        time.strftime("git-roost  %H:%M:%S"),
+        "git-roost v%s  %s" % (__version__, time.strftime("%H:%M:%S")),
         "view:%s" % view_mode,
         "sort:%s" % sort_mode,
         "filter:%s" % FILTER_LABELS[filt],
@@ -1568,7 +1703,10 @@ def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table",
     ]
     if loading:
         bits.append(loading)
-    return c("  ".join(bits), DIM) + c("   [?] keys", BOLD)
+    line = c("  ".join(bits), DIM) + c("   [?] keys", BOLD)
+    if note:
+        line += c("   " + note, CYAN, BOLD)
+    return line
 
 
 # ------------------------------------------------------------------------ cli
@@ -1594,7 +1732,7 @@ def rewrite_status(width, view, args, loading):
         "log" if view.get("log") else "table")
     line = status_line(
         view["sort"], view["filter"], view["quiet"], args.watch,
-        view_mode, loading=loading)
+        view_mode, loading=loading, note=view.get("note"))
     sys.stdout.write("\033[1;1H%s\033[K" % line)
     sys.stdout.flush()
 
@@ -1621,13 +1759,14 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
         shown = []
     else:
         out = render_view(states, width, view, changed,
-                          getattr(args, "github", False), height=body_h)
+                          view.get("github", getattr(args, "github", False)),
+                          height=body_h)
         shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
     view_mode = "detail" if view.get("detail") is not None else (
         "log" if view.get("log") else "table")
     frame = [status_line(
         view["sort"], view["filter"], view["quiet"], args.watch,
-        view_mode, loading=loading)] + list(out)
+        view_mode, loading=loading, note=view.get("note"))] + list(out)
     # Watch only runs when ansi is on (see main). The old "print another
     # separator + frame" else branch is what flooded a non-VT cmd every 3s.
     if not ansi:
@@ -1701,11 +1840,16 @@ def body(args, width, view=None, changed=None, github_map=None):
     this flag and do not set it.
     """
     states = scan(args)
-    if getattr(args, "github", False):
+    # The `g` key can flip the column away from what the flags said, so a live
+    # view's word beats args -- same relationship sort/filter/quiet already
+    # have between their flags and their keys.
+    show_github = getattr(args, "github", False)
+    if view is not None:
+        show_github = view.get("github", show_github)
+    if show_github:
         if github_map is None:
             github_map = github_facts_map(states)
         apply_github_facts(states, github_map)
-    show_github = getattr(args, "github", False)
     if args.json:
         filt = view["filter"] if view is not None else args.filter
         if filt != "all":
@@ -2030,6 +2174,9 @@ def main(argv=None):
         "sort": args.sort, "filter": args.filter, "quiet": args.all,
         "log": args.log is not None, "log_limit": args.log if args.log is not None else 25,
         "cursor": 0, "detail": None,
+        # --github seeds the toggle the same way --all seeds quiet: the flag
+        # is the starting position and `g` moves from there.
+        "github": args.github, "note": None, "page": 10,
     }
     helping = False
     last_states = []
@@ -2060,6 +2207,9 @@ def main(argv=None):
                 size = shutil.get_terminal_size((160, 24))
                 width = size.columns
                 height = max(8, size.lines)
+                # What pgup/pgdn mean this frame: the body rows the terminal
+                # can show (status line + table header + summary trimmed off).
+                view["page"] = max(1, height - 4)
                 spin_n = [0]
                 last_paint = [0.0]
 
@@ -2090,7 +2240,7 @@ def main(argv=None):
                     shown = draw_watch_frame(
                         ansi, width, height, view, args, helping, states, {})
                 else:
-                    if args.github:
+                    if view["github"]:
                         now = time.time()
                         due = now - last_gh_fetch >= args.github_interval or not github_map
                         if due:
@@ -2111,6 +2261,10 @@ def main(argv=None):
                 # exactly the moment someone was reading it.
                 key = keys.wait(3600 if helping and keys.enabled else args.watch)
                 if key is None:
+                    # A note has now been on screen for a full interval --
+                    # long enough to have confirmed the keypress. Let it fade
+                    # rather than sit there going stale.
+                    view["note"] = None
                     continue
                 if helping:
                     helping = False
@@ -2121,6 +2275,9 @@ def main(argv=None):
                 if view.get("detail") is not None:
                     view["detail"] = None
                     continue
+                # Each keypress speaks for itself: whatever the last one said
+                # is stale the moment a new key arrives.
+                view["note"] = None
                 action = apply_key(view, key, shown=shown)
                 if action == "quit":
                     break

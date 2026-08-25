@@ -144,15 +144,24 @@ Watch mode takes keys:
 
 | Key | Action |
 |---|---|
-| `?` | the keymap |
+| `?` | the keymap, plus how to read the table |
 | `r` | refresh now |
 | `s` | sort: recent / repo / work |
 | `f` | filter: all / uncommitted / mid-operation |
 | `a` | expand or collapse `QUIET` |
 | `l` | toggle the fleet table and the commit feed, without restarting |
-| `j` / `k` | move the row cursor; the viewport follows |
+| `g` | toggle the PR/CI column, without restarting (needs `gh`; network) |
+| `j` / `k` or arrows | move the row cursor; the viewport follows |
+| `pgup` / `pgdn` | move the cursor a viewport at a time |
+| `home` / `end` | jump the cursor to the first / last row |
+| `y` | copy the highlighted tree's path to the clipboard |
 | `enter` | open a detail view for the highlighted tree |
 | `q` | quit |
+
+Every handled key confirms itself with a short note in the status line —
+`sort: repo`, `copied: …` — which fades on the next timed redraw. The status
+line also carries the running version, so "which git-roost is this box on" is
+answerable mid-watch.
 
 `-w` is a screen, not a dump — and it is the default on a TTY. It uses the
 terminal height, keeps the status line and `?` on screen, and `j`/`k` scroll

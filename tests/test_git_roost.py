@@ -698,7 +698,23 @@ class TestWatchKeys(unittest.TestCase):
         # would look like a broken feature rather than a missing one.
         documented = {k for k, _ in git_roost.KEYMAP}
         self.assertEqual(
-            documented, {"?", "r", "s", "f", "a", "l", "j", "k", "enter", "q"})
+            documented, {"?", "r", "s", "f", "a", "l", "g", "j", "k",
+                         "pgup", "home", "y", "enter", "q"})
+
+    def test_every_nav_name_a_reader_can_emit_is_documented_or_handled(self):
+        # Keys.wait folds platform-specific arrow/page/home sequences into
+        # symbolic names. Every name either binds in apply_key or it is a
+        # dead map entry -- exercise each one and require no crash and a
+        # plausible cursor.
+        names = set(git_roost.WIN_NAV_KEYS.values()) | set(
+            git_roost.ANSI_NAV_KEYS.values())
+        self.assertEqual(names, {"up", "down", "home", "end", "pgup", "pgdn"})
+        shown = [renderable(repo=str(i)) for i in range(30)]
+        for name in names:
+            view = {"sort": "recent", "filter": "all", "quiet": False,
+                    "cursor": 5, "page": 10}
+            self.assertIsNone(git_roost.apply_key(view, name, shown=shown))
+            self.assertTrue(0 <= view["cursor"] < len(shown))
 
     def test_help_overlay_lists_every_key(self):
         out = "\n".join(git_roost.help_lines())
@@ -790,6 +806,25 @@ class TestWatchKeys(unittest.TestCase):
         line = git_roost.status_line(
             "recent", "all", False, 3.0, loading="scanning 3/9 |")
         self.assertIn("scanning 3/9", line)
+
+    def test_status_line_carries_the_version(self):
+        # leghorn's #18, ported: mid-watch is where "which version is this
+        # box running" gets asked, and --version is not reachable from there.
+        line = git_roost.status_line("recent", "all", False, 3.0)
+        self.assertIn("v" + git_roost.__version__, line)
+
+    def test_status_line_shows_a_note_only_when_given(self):
+        with_note = git_roost.status_line(
+            "recent", "all", False, 3.0, note="copied: /tmp/x")
+        without = git_roost.status_line("recent", "all", False, 3.0)
+        self.assertIn("copied: /tmp/x", with_note)
+        self.assertNotIn("copied", without)
+
+    def test_help_explains_the_display_not_just_the_keys(self):
+        out = "\n".join(git_roost.help_lines())
+        for label in ("MID-OPERATION", "DIVERGED", "UNCOMMITTED", "UNPUSHED",
+                      "BEHIND", "ACTIVE", "QUIET", "WORK", "DRIFT", "STASH"):
+            self.assertIn(label, out)
 
     @needs_git
     def test_collect_progress_reaches_the_total(self):
@@ -887,6 +922,92 @@ class TestCursorAndDetail(unittest.TestCase):
         git_roost.apply_key(view, "j", shown=[])
         git_roost.apply_key(view, "k", shown=None)
         self.assertEqual(view["cursor"], 0)
+
+    def test_arrow_names_alias_j_and_k(self):
+        shown = [renderable(repo="a"), renderable(repo="b"), renderable(repo="c")]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        git_roost.apply_key(view, "down", shown=shown)
+        git_roost.apply_key(view, "down", shown=shown)
+        self.assertEqual(view["cursor"], 2)
+        git_roost.apply_key(view, "up", shown=shown)
+        self.assertEqual(view["cursor"], 1)
+
+    def test_page_keys_move_by_the_viewport_and_clamp(self):
+        shown = [renderable(repo=str(i)) for i in range(25)]
+        view = {"sort": "recent", "filter": "all", "quiet": False,
+                "cursor": 0, "page": 10}
+        git_roost.apply_key(view, "pgdn", shown=shown)
+        self.assertEqual(view["cursor"], 10)
+        git_roost.apply_key(view, "pgdn", shown=shown)
+        git_roost.apply_key(view, "pgdn", shown=shown)  # past the end
+        self.assertEqual(view["cursor"], 24)
+        git_roost.apply_key(view, "pgup", shown=shown)
+        self.assertEqual(view["cursor"], 14)
+        for _ in range(3):  # past the top
+            git_roost.apply_key(view, "pgup", shown=shown)
+        self.assertEqual(view["cursor"], 0)
+
+    def test_home_and_end_jump_to_the_edges(self):
+        shown = [renderable(repo=str(i)) for i in range(7)]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 3}
+        git_roost.apply_key(view, "end", shown=shown)
+        self.assertEqual(view["cursor"], 6)
+        git_roost.apply_key(view, "home", shown=shown)
+        self.assertEqual(view["cursor"], 0)
+
+    def test_g_toggles_the_github_column_when_gh_exists(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False,
+                "github": False}
+        with mock.patch.object(git_roost, "GH_PATH", "/usr/bin/gh"):
+            git_roost.apply_key(view, "g")
+            self.assertTrue(view["github"])
+            git_roost.apply_key(view, "G")
+            self.assertFalse(view["github"])
+
+    def test_g_without_gh_refuses_with_a_note_instead_of_a_blank_column(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False,
+                "github": False}
+        with mock.patch.object(git_roost, "GH_PATH", None):
+            git_roost.apply_key(view, "g")
+        self.assertFalse(view["github"])
+        self.assertIn("gh", view["note"])
+
+    def test_y_yanks_the_highlighted_path(self):
+        shown = [renderable(repo="a"), renderable(repo="b")]
+        shown[1]["path"] = "/tmp/somewhere/b"
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 1}
+        with mock.patch.object(git_roost, "to_clipboard",
+                               return_value=True) as clip:
+            git_roost.apply_key(view, "y", shown=shown)
+        clip.assert_called_once_with("/tmp/somewhere/b")
+        self.assertIn("/tmp/somewhere/b", view["note"])
+
+    def test_y_reports_a_missing_clipboard_helper(self):
+        shown = [renderable(repo="a")]
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        with mock.patch.object(git_roost, "to_clipboard", return_value=False):
+            git_roost.apply_key(view, "y", shown=shown)
+        self.assertIn("clipboard", view["note"])
+
+    def test_y_with_no_shown_rows_does_nothing(self):
+        view = {"sort": "recent", "filter": "all", "quiet": False, "cursor": 0}
+        with mock.patch.object(git_roost, "to_clipboard") as clip:
+            git_roost.apply_key(view, "y", shown=[])
+        clip.assert_not_called()
+
+    def test_view_shaping_keys_leave_a_note(self):
+        # The transient feedback line: a handled key must say what it did,
+        # because the status line's own words change too subtly to confirm
+        # the press registered.
+        view = {"sort": "recent", "filter": "all", "quiet": False, "log": False}
+        git_roost.apply_key(view, "s")
+        self.assertEqual(view["note"], "sort: repo")
+        git_roost.apply_key(view, "f")
+        self.assertEqual(view["note"], "filter: uncommitted")
+        git_roost.apply_key(view, "a")
+        self.assertEqual(view["note"], "quiet: shown")
+        git_roost.apply_key(view, "l")
+        self.assertEqual(view["note"], "view: commit feed")
 
     def test_changing_sort_resets_the_cursor(self):
         # A cursor left at row 4 after a sort that now has only 2 rows on
