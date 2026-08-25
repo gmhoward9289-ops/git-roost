@@ -565,6 +565,17 @@ class TestRender(unittest.TestCase):
             self.assertIn("2 tree(s) across 2 repo(s)", out)
 
 
+def trees(text):
+    """The tree records out of a --json capture, whichever shape it is.
+
+    The default is the {schema, version, trees} envelope; --legacy-json is
+    still the bare list. Tests that only care about the records go through
+    this; the envelope itself has its own dedicated assertions.
+    """
+    data = json.loads(text)
+    return data["trees"] if isinstance(data, dict) else data
+
+
 def renderable(**kw):
     """A state complete enough for render(), which needs more than bucket() does."""
     base = dict(state(), branch="main", detached=False, base="origin/main",
@@ -1074,7 +1085,7 @@ class TestCli(unittest.TestCase):
             finally:
                 os.chdir(prev)
             self.assertEqual(rc, 0)
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             self.assertEqual([r["repo"] for r in data], ["alpha"])
 
     @needs_git
@@ -1084,18 +1095,63 @@ class TestCli(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 git_roost.main(["--root", tmp, "--json"])
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             self.assertEqual(len(data), 1)
             self.assertEqual(data[0]["repo"], "alpha")
 
     @needs_git
+    def test_json_envelope_names_its_schema_and_version(self):
+        # Same convention as every sibling: a consumer can tell which shape
+        # it got before indexing into it, and which git-roost produced it.
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json"])
+            data = json.loads(buf.getvalue())
+            self.assertEqual(set(data), {"schema", "version", "trees"})
+            self.assertEqual(data["schema"], git_roost.JSON_SCHEMA)
+            self.assertEqual(data["version"], git_roost.__version__)
+            self.assertIsInstance(data["trees"], list)
+
+    @needs_git
+    def test_legacy_json_is_the_bare_list(self):
+        # The escape hatch for consumers written against <= 0.5: the exact
+        # old shape, not a differently-decorated new one.
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "alpha")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--json", "--legacy-json"])
+            data = json.loads(buf.getvalue())
+            self.assertIsInstance(data, list)
+            self.assertEqual(data[0]["repo"], "alpha")
+
+    @needs_git
+    def test_check_json_wraps_and_honours_legacy_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dirty = make_repo(Path(tmp) / "dirty")
+            (dirty / "README.md").write_text("changed\n")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--check", "--json"])
+            data = json.loads(buf.getvalue())
+            self.assertEqual(data["schema"], git_roost.JSON_SCHEMA)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.main(["--root", tmp, "--check", "--json",
+                                "--legacy-json"])
+            self.assertIsInstance(json.loads(buf.getvalue()), list)
+
+    @needs_git
     def test_json_record_keys_are_a_stable_contract(self):
-        # ccboard (leghorn's data layer) consumes `git-roost --json`. Adding a
-        # key is safe; renaming or removing one breaks a consumer this suite
-        # cannot see. If you are changing the shape deliberately, update this
-        # set and ccboard's gather_git() together. assertEqual, not a subset
-        # check: a subset check passes when a key is deleted, which is exactly
-        # the case that breaks the consumer.
+        # henhouse (leghorn's data layer) consumes `git-roost --json`. Adding
+        # a key is safe; renaming or removing one breaks a consumer this suite
+        # cannot see -- and it is also what JSON_SCHEMA's version suffix is
+        # for. If you are changing the shape deliberately, bump the schema,
+        # update this set and henhouse's gather_git() together. assertEqual,
+        # not a subset check: a subset check passes when a key is deleted,
+        # which is exactly the case that breaks the consumer.
         EXPECTED = {
             "ahead", "base", "behind", "branch", "common_dir", "conflicts",
             "detached", "last_author", "last_hash", "last_subject", "last_ts",
@@ -1107,7 +1163,7 @@ class TestCli(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 git_roost.main(["--root", tmp, "--json"])
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             self.assertEqual(set(data[0]), EXPECTED)
 
     def test_sort_and_filter_flags_reach_the_one_shot_render(self):
@@ -1410,7 +1466,7 @@ class TestGithubFlagGating(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 git_roost.main(["--root", tmp, "--json"])
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             if data:
                 for key in git_roost.GITHUB_KEYS:
                     self.assertNotIn(key, data[0])
@@ -1426,7 +1482,7 @@ class TestGithubFlagGating(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 git_roost.main(["--root", tmp, "--json", "--github"])
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             for key in git_roost.GITHUB_KEYS:
                 self.assertIn(key, data[0])
             self.assertIsNone(data[0]["pr_number"])
@@ -1441,7 +1497,7 @@ class TestGithubFlagGating(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 git_roost.main(["--root", tmp, "--json", "--github"])
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             self.assertEqual(data[0]["pr_number"], 42)
             self.assertEqual(data[0]["pr_review"], "APPROVED")
 
@@ -1527,7 +1583,7 @@ class TestRootEnvVar(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 git_roost.main(["--root", tmp, "--repo", "alp", "--json"])
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             self.assertEqual([r["repo"] for r in data], ["alpha"])
 
     @needs_git
@@ -1539,7 +1595,7 @@ class TestRootEnvVar(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 git_roost.main(["--root", tmp, "--repo", "ALPHA", "--repo", "beta", "--json"])
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             self.assertEqual(sorted(r["repo"] for r in data), ["alpha", "beta"])
 
     @needs_git
@@ -1551,7 +1607,7 @@ class TestRootEnvVar(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 git_roost.main(["--root", tmp, "--filter", "dirty", "--json"])
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             self.assertEqual([r["repo"] for r in data], ["dirty"])
 
     @needs_git
@@ -1599,7 +1655,7 @@ class TestRootEnvVar(unittest.TestCase):
             with redirect_stdout(buf):
                 rc = git_roost.main(["--root", tmp, "--check", "--json"])
             self.assertEqual(rc, 1)
-            data = json.loads(buf.getvalue())
+            data = trees(buf.getvalue())
             self.assertEqual([r["repo"] for r in data], ["dirty"])
 
     @needs_git

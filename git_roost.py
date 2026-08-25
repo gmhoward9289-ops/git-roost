@@ -1002,6 +1002,30 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
     return clip_to_height(lines, height, focus_line)
 
 
+# ------------------------------------------------------------------ json shape
+
+# Every sibling names its JSON shape (roost stamps schema+version, legbar puts
+# version first, henhouse says "henhouse.session.v1"); a bare list was the
+# outlier, and it left consumers no way to tell which contract they got. Bump
+# the suffix when a key is renamed or removed -- adding keys is not a new
+# schema, the same line the key-contract test in tests/ already draws.
+JSON_SCHEMA = "git-roost.trees.v1"
+
+
+def json_document(states, legacy=False):
+    """The --json payload: a named envelope, or the pre-0.6 bare list.
+
+    `legacy` is --legacy-json, the same escape hatch legbar and henhouse
+    shipped when their shapes changed: one flag, not a version sniff, for any
+    consumer written against the old contract.
+    """
+    if legacy:
+        return json.dumps(states, indent=2, sort_keys=True)
+    return json.dumps(
+        {"schema": JSON_SCHEMA, "version": __version__, "trees": states},
+        indent=2, sort_keys=True)
+
+
 # ---------------------------------------------------------------- commit feed
 
 def commits_for(st, limit):
@@ -1580,7 +1604,7 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
     """One alternate-screen paint. Returns the row list j/k walk."""
     body_h = max(4, height - 1)
     if getattr(args, "json", False):
-        out = [json.dumps(states, indent=2, sort_keys=True)]
+        out = [json_document(states, getattr(args, "legacy_json", False))]
         shown = []
     elif helping:
         out = clip_to_height(help_lines(), body_h, 0)
@@ -1686,7 +1710,7 @@ def body(args, width, view=None, changed=None, github_map=None):
         filt = view["filter"] if view is not None else args.filter
         if filt != "all":
             states = [s for s in states if passes_filter(s, filt)]
-        return [json.dumps(states, indent=2, sort_keys=True)], states
+        return [json_document(states, getattr(args, "legacy_json", False))], states
     if not states:
         # First-run / wrong-root: say where we looked. An empty --log feed
         # of nothing is the same situation as an empty table.
@@ -1800,7 +1824,11 @@ def main(argv=None):
                          "(mid-operation), diverged (also ahead+behind a base) or "
                          "dirty (also uncommitted work) trips it. Checked against "
                          "the whole fleet, not --filter. Default none (always 0).")
-    ap.add_argument("--json", action="store_true", help="emit records as JSON")
+    ap.add_argument("--json", action="store_true",
+                    help="emit a JSON envelope: {schema, version, trees}")
+    ap.add_argument("--legacy-json", action="store_true",
+                    help="with --json, emit the bare pre-0.6 list of records "
+                         "instead of the envelope")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
     ap.add_argument("--github", action="store_true",
                     help="add a PR/CI column via `gh` (opt-in: network calls, "
@@ -1855,7 +1883,7 @@ def main(argv=None):
         states = scan(args)
         offenders = [s for s in states if needs_attention(s)]
         if args.json:
-            print(json.dumps(offenders, indent=2, sort_keys=True))
+            print(json_document(offenders, args.legacy_json))
         elif not offenders:
             print("clean: no tree is mid-operation, diverged, or has uncommitted work")
         else:
