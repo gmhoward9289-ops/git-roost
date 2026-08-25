@@ -1746,9 +1746,12 @@ def exit_code(states, fail_on):
     return 0
 
 
-def main(argv=None):
-    global COLOR
+def build_parser():
+    """The CLI, as a function so completion can enumerate the real flag set.
 
+    Anything hand-listed in a completion script drifts the first time a flag
+    is added; deriving the words from the parser makes drift impossible.
+    """
     ap = argparse.ArgumentParser(
         prog="git-roost",
         description=(
@@ -1810,7 +1813,128 @@ def main(argv=None):
                     help="in watch mode, refresh PR/CI data at most every SECS "
                          "seconds rather than every redraw (default 30); no "
                          "effect outside watch mode or without --github")
+    ap.add_argument("--print-completion", choices=("bash", "zsh", "powershell"),
+                    metavar="SHELL",
+                    help="print a completion script for SHELL (bash, zsh, "
+                         "powershell) and exit")
+    return ap
+
+
+def _completion_flag_words():
+    words = []
+    for action in build_parser()._actions:
+        if action.option_strings:
+            words.extend(action.option_strings)
+    return sorted(set(words), key=lambda s: (len(s), s))
+
+
+# The flags that consume a value, kept in one place so the three scripts agree
+# on when the *next* word is a value rather than a flag. Same approach as
+# roost's: no argcomplete dependency, just the parser's own word list plus
+# this map of what each value can be ("" means free-form: no suggestions).
+_COMPLETION_VALUE_FLAGS = {
+    "-w": "", "--watch": "", "--log": "", "--root": "", "--depth": "",
+    "--repo": "", "--github-interval": "",
+    "--sort": " ".join(SORT_MODES),
+    "--filter": " ".join(FILTER_MODES),
+    "--fail-on": "none dirty diverged stuck",
+    "--print-completion": "bash zsh powershell",
+}
+
+
+def print_completion(shell):
+    flags = " ".join(_completion_flag_words())
+    value_flags = "|".join(sorted(_COMPLETION_VALUE_FLAGS))
+    choice_cases = "\n".join(
+        '        %s)\n            COMPREPLY=( $(compgen -W "%s" -- "$cur") )\n'
+        '            return 0\n            ;;' % (flag, choices)
+        for flag, choices in sorted(_COMPLETION_VALUE_FLAGS.items()) if choices)
+    if shell == "bash":
+        return """# bash completion for git-roost. Install to
+# /usr/share/bash-completion/completions/git-roost, or eval:
+#   eval "$(git-roost --print-completion bash)"
+_git_roost() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    local opts="%s"
+    case "$prev" in
+%s
+        %s)
+            return 0
+            ;;
+    esac
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    fi
+}
+complete -F _git_roost git-roost
+""" % (flags, choice_cases, value_flags)
+    if shell == "zsh":
+        return """#compdef git-roost
+# zsh completion for git-roost. Install to
+# /usr/share/zsh/vendor-completions/_git-roost, or eval:
+#   source <(git-roost --print-completion zsh)
+_arguments -S \\
+  '--version[print the version and exit]' \\
+  '(-w --watch)'{-w,--watch}'[redraw every SECS seconds]:seconds:' \\
+  '(-1 --once)'{-1,--once}'[render once and exit]' \\
+  '--log[commit feed across every repo, newest first]:count:' \\
+  '(-a --all)'{-a,--all}'[expand the QUIET group]' \\
+  '*--root[where to look for repos]:directory:_files -/' \\
+  '--depth[how deep to search below each root]:depth:' \\
+  '*--repo[only repos whose name contains NAME]:name:' \\
+  '--sort[sort within each group]:mode:(%s)' \\
+  '--filter[show only this view]:mode:(%s)' \\
+  '--check[exit 1 if any tree needs a human first]' \\
+  '--fail-on[exit 1 on this condition]:condition:(none dirty diverged stuck)' \\
+  '--json[emit records as JSON]' \\
+  '--no-color[disable colour output]' \\
+  '--github[add a PR/CI column via gh]' \\
+  '--github-interval[PR/CI refresh interval in watch mode]:seconds:' \\
+  '--print-completion[print a shell completion script]:shell:(bash zsh powershell)'
+""" % (" ".join(SORT_MODES), " ".join(FILTER_MODES))
+    if shell == "powershell":
+        ps_flags = ", ".join("'%s'" % f for f in _completion_flag_words())
+        ps_value_flags = ", ".join("'%s'" % f for f in sorted(_COMPLETION_VALUE_FLAGS))
+        ps_choices = "; ".join(
+            "'%s' = @(%s)" % (flag, ", ".join("'%s'" % w for w in choices.split()))
+            for flag, choices in sorted(_COMPLETION_VALUE_FLAGS.items()) if choices)
+        return """# PowerShell completion for git-roost. Add to your profile:
+#   . (git-roost --print-completion powershell | Out-String | Invoke-Expression)
+Register-ArgumentCompleter -Native -CommandName git-roost -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $flags = @(%s)
+    $valueFlags = @(%s)
+    $choices = @{%s}
+    $prev = $commandAst.CommandElements[
+        [Math]::Max(0, $commandAst.CommandElements.Count - 2)].ToString()
+    if ($valueFlags -contains $prev) {
+        if ($choices.ContainsKey($prev)) {
+            $choices[$prev] | Where-Object { $_ -like "$wordToComplete*" } |
+                ForEach-Object {
+                    [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+                }
+        }
+        return
+    }
+    $flags | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)
+    }
+}
+""" % (ps_flags, ps_value_flags, ps_choices)
+    raise ValueError("unknown shell %r" % shell)
+
+
+def main(argv=None):
+    global COLOR
+
+    ap = build_parser()
     args = ap.parse_args(argv)
+
+    if args.print_completion:
+        sys.stdout.write(print_completion(args.print_completion))
+        return 0
 
     # TUI is the default on a real terminal. Scripts, pipes, --once and --json
     # stay one-shot so `git-roost | less` and the test harness never hang in

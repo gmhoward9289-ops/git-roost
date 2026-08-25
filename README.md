@@ -102,6 +102,16 @@ $env:GIT_ROOST_ROOT = "$HOME\wherever"     # PowerShell
 `--root` still wins for one call. Deeper trees need `--depth`. Use `-1` /
 `--once` (or pipe stdout) for a one-shot table instead of the TUI.
 
+Tab completion is built in — print the script for your shell and source it
+from your profile (the flag words come from the argument parser itself, so
+the script can never drift from the real flag set):
+
+```bash
+eval "$(git-roost --print-completion bash)"      # bash
+source <(git-roost --print-completion zsh)       # zsh
+. (git-roost --print-completion powershell | Out-String | Invoke-Expression)  # PowerShell
+```
+
 The man page installs to `<prefix>/share/man/man1`. A system or Homebrew install
 puts that on the default MANPATH; a venv or pipx install does not, so `man
 git-roost` there needs `MANPATH` help.
