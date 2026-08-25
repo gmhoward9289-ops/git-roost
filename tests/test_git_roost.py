@@ -1048,6 +1048,49 @@ class TestCli(unittest.TestCase):
                 git_roost.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
 
+    def test_print_completion_emits_a_script_and_exits_clean(self):
+        for shell, marker in (("bash", "complete -F _git_roost git-roost"),
+                              ("zsh", "#compdef git-roost"),
+                              ("powershell", "Register-ArgumentCompleter")):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = git_roost.main(["--print-completion", shell])
+            self.assertEqual(rc, 0)
+            self.assertIn(marker, buf.getvalue())
+
+    def test_print_completion_rejects_an_unknown_shell(self):
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                git_roost.main(["--print-completion", "fish"])
+
+    def test_completion_words_track_the_parser(self):
+        # The whole point of deriving the word list: a flag added to the
+        # parser appears in every script without anyone remembering to.
+        words = git_roost._completion_flag_words()
+        self.assertIn("--print-completion", words)
+        self.assertIn("--github", words)
+        for shell in ("bash", "powershell"):
+            script = git_roost.print_completion(shell)
+            for w in words:
+                self.assertIn(w, script)
+
+    def test_completion_value_flags_all_exist_on_the_parser(self):
+        # A value flag renamed on the parser but not here would silently stop
+        # suppressing flag suggestions after it.
+        words = set(git_roost._completion_flag_words())
+        for flag in git_roost._COMPLETION_VALUE_FLAGS:
+            self.assertIn(flag, words)
+
+    def test_completion_never_runs_a_scan(self):
+        # Completion must work on a box with no repos and no scan roots --
+        # it is parser metadata, not a fleet question.
+        with mock.patch.object(git_roost, "scan",
+                               side_effect=AssertionError("scanned")):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = git_roost.main(["--print-completion", "bash"])
+            self.assertEqual(rc, 0)
+
     def test_runs_with_zero_repositories(self):
         # The contract with packaging: --help and a bare run must work on a box
         # that has no repos at all.
