@@ -256,6 +256,21 @@ window.
 default JSON shape is unchanged for any consumer that never asks for GitHub
 data.
 
+`--json` emits a named envelope, so a consumer can tell which contract it got
+before indexing into it — the same convention the sibling tools use:
+
+```json
+{
+  "schema": "git-roost.trees.v1",
+  "version": "0.6.0",
+  "trees": [ { "repo": "…", "tree": "…", "…": "…" } ]
+}
+```
+
+The tree records themselves are unchanged. A consumer written against the
+pre-0.6 bare list can pass `--legacy-json` to keep exactly that shape, or
+unwrap in one line: `jq '.trees // .'` accepts both.
+
 ## Reading the table
 
 Groups are ordered by what it costs to ignore them, not by how interesting they
