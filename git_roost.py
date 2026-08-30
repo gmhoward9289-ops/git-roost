@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import shutil
 import sys
@@ -185,16 +186,174 @@ def paint_over(text, *codes):
     return arm + text.replace(RESET, RESET + arm) + RESET
 
 
+# ---------------------------------------------------------------- dialects
+#
+# Two glyph dialects, one vocabulary (the flock design language): every slot
+# means the same thing in both, only the codepoints differ. ASCII is the
+# default and *always* the dialect of pipe-safe output -- --once, --json,
+# anything non-interactive stays byte-identical to what it always printed.
+# The Unicode tier is chosen once at startup, only for watch mode, only when
+# the terminal's own stdout encoding says it can render it. A frame must
+# never mix dialects, which is why every glyph comes from the active table
+# rather than being spelled inline.
+#
+# The WORK cell (`12+3?`) is deliberately absent from the table: that is the
+# pipe-safe git vocabulary shared across the flock, identical in both
+# dialects.
+ASCII_GLYPHS = {
+    "up": "^", "down": "v",
+    "ok": "+", "fail": "x", "pending": "~",
+    "ellipsis": "...",
+    "frame": False,
+}
+UNICODE_GLYPHS = {
+    "up": "↑", "down": "↓",          # ↑ ↓
+    "ok": "✓", "fail": "✗",          # ✓ ✗
+    "pending": "○",                       # ○
+    "ellipsis": "…",                      # …
+    "frame": True,
+}
+
+# The active table. Module default is ASCII so headless callers -- tests,
+# --json, `git-roost | less` -- never see a Unicode byte without asking.
+G = ASCII_GLYPHS
+
+# Every character the Unicode table can emit, so ascii_safe() can let the
+# dialect's own glyphs through while still stripping unrenderable *data*.
+_UNICODE_GLYPH_CHARS = frozenset(
+    ch for v in UNICODE_GLYPHS.values() if isinstance(v, str) for ch in v
+) | frozenset("╭╮╰╯─│")  # ╭ ╮ ╰ ╯ ─ │
+
+
+def unicode_capable(stream=None, env=None):
+    """Whether the interactive terminal can render the Unicode dialect.
+
+    The probe is the stdout encoding: a UTF-8 stream on a TTY renders the
+    tier correctly (Windows Terminal included -- the historical mojibake was
+    the legacy-codepage console, which fails this exact check). GIT_ROOST_ASCII
+    forces the fallback, same GIT_ROOST_* convention as every other knob here.
+    """
+    env = os.environ if env is None else env
+    if env.get("GIT_ROOST_ASCII"):
+        return False
+    stream = sys.stdout if stream is None else stream
+    try:
+        if not stream.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    enc = (getattr(stream, "encoding", "") or "").lower()
+    return enc.replace("-", "").replace("_", "").startswith("utf")
+
+
+def set_dialect(unicode_ok):
+    """Hold the probe's answer for the whole session -- chosen once, at startup."""
+    global G
+    G = UNICODE_GLYPHS if unicode_ok else ASCII_GLYPHS
+
+
+def elide(text, width):
+    """Truncate with the active dialect's elision mark."""
+    if len(text) <= width:
+        return text
+    mark = G["ellipsis"]
+    return text[: max(0, width - len(mark))] + mark
+
+
+def elide_name(text, width):
+    """Truncate a repo/tree/branch name.
+
+    ASCII keeps the plain head slice it always had. The Unicode dialect keeps
+    both ends (the leghorn elision rule): the tail is what distinguishes
+    `repo/branch` from `repo`, so `wings…tion-a1b2` beats `wings-standard…`.
+    """
+    if len(text) <= width:
+        return text
+    if not G["frame"]:
+        return text[:width]
+    mark = G["ellipsis"]
+    keep = max(1, width - len(mark))
+    head = (keep + 1) // 2
+    tail = keep - head
+    return text[:head] + mark + (text[-tail:] if tail else "")
+
+
+_ANSI_RE = re.compile("\033\\[[0-9;]*m")
+
+
+def visible_len(s):
+    """Length as the terminal will paint it -- len() counts SGR escapes too."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def clip_visible(s, width):
+    """Clip to a visible width, copying escapes through and re-resetting."""
+    if visible_len(s) <= width:
+        return s
+    out = []
+    vis = 0
+    i = 0
+    saw_escape = False
+    while i < len(s) and vis < width:
+        m = _ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            saw_escape = True
+            i = m.end()
+            continue
+        out.append(s[i])
+        vis += 1
+        i += 1
+    if saw_escape:
+        out.append(RESET)
+    return "".join(out)
+
+
+def overlay_frame(lines, title, width, height=None):
+    """Frame a bounded overlay (detail, help) per the active dialect.
+
+    The Unicode dialect draws the flock's rounded box (`╭─ DETAIL ─…`),
+    chrome cyan, bold uppercase title inset two columns -- an overlay is a
+    bounded region, which is exactly where a frame belongs; the main fleet
+    table stays flat in both dialects. ASCII keeps today's frameless render
+    byte-for-byte: the charter's fallback slot for a frame is the bold
+    uppercase title the overlay body already opens with.
+    """
+    if not G["frame"]:
+        return clip_to_height(lines, height, 0)
+    # Never write into the last column: a glyph there wraps onto the next row.
+    w = max(20, width - 1)
+    inner_w = w - 4
+    inner_h = None if height is None else max(1, height - 2)
+    body = clip_to_height(lines, inner_h, 0)
+    label = " %s " % title.upper()
+    label = label[: max(0, w - 6)]
+    top = (c("╭─", CYAN)
+           + c(label, CYAN, BOLD)
+           + c("─" * max(0, w - 3 - len(label)) + "╮", CYAN))
+    out = [top]
+    for line in body:
+        clipped = clip_visible(line, inner_w)
+        pad = " " * max(0, inner_w - visible_len(clipped))
+        out.append(c("│ ", CYAN) + clipped + pad + c(" │", CYAN))
+    out.append(c("╰" + "─" * (w - 2) + "╯", CYAN))
+    return out
+
+
 def ascii_safe(s):
     """Drop characters the console cannot render.
 
     Commit subjects are free-form prose and routinely carry em dashes and smart
     quotes; the Windows console codepage turns those into replacement blobs
-    mid-table.
+    mid-table. Data is stripped in both dialects -- prose is unvetted, the
+    glyph tables are not -- but the active dialect's own glyphs pass through,
+    so a subject that already went through elision keeps its `…`.
     """
     if not s:
         return ""
-    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in s)
+    keep = _UNICODE_GLYPH_CHARS if G["frame"] else frozenset()
+    return "".join(
+        ch if 32 <= ord(ch) < 127 or ch in keep else "?" for ch in s)
 
 
 def enable_windows_ansi():
@@ -681,13 +840,19 @@ def work(st):
 
 
 def drift(st):
-    """Position against the base branch: '=', '^2', 'v3', '^2v3', or '-'."""
+    """Position against the base branch: '=', '^2', 'v3', '^2v3', or '-'.
+
+    The ahead/behind marks come from the active dialect table -- `↑2↓3` in
+    the Unicode tier, byte-identical `^2v3` everywhere ASCII holds. `=` and
+    `-` are already both dialects' spelling.
+    """
     if not st["base"] or st["ahead"] is None:
         return "-"
     ahead, behind = st["ahead"], st["behind"]
     if not ahead and not behind:
         return "="
-    return ("^%d" % ahead if ahead else "") + ("v%d" % behind if behind else "")
+    return ((G["up"] + "%d" % ahead if ahead else "")
+            + (G["down"] + "%d" % behind if behind else ""))
 
 
 # Sort cycles *within* a group, never across one. The group order is the whole
@@ -898,9 +1063,9 @@ def clip_to_height(lines, height, focus=0):
     # must name the way to the rest as loudly as anything else asking for a
     # human -- the key names stay, they are the remedy.
     if above and window:
-        window[0] = c("  ... %d more above  (k)" % above, YELLOW)
+        window[0] = c("  %s %d more above  (k)" % (G["ellipsis"], above), YELLOW)
     if below and window:
-        window[-1] = c("  ... %d more below  (j)" % below, YELLOW)
+        window[-1] = c("  %s %d more below  (j)" % (G["ellipsis"], below), YELLOW)
     return [header] + window + [footer]
 
 
@@ -953,18 +1118,17 @@ def render_pending(paths, ordered, width=160, height=None):
     for path, st in zip(paths, ordered):
         name = Path(path).name
         if st:
-            subject = ascii_safe(st.get("last_subject") or "")
-            if len(subject) > 40:
-                subject = subject[:37] + "..."
+            subject = elide(ascii_safe(st.get("last_subject") or ""), 40)
             lines.append("  %s  %s  %s  %s  %s" % (
-                st["repo"][:24].ljust(24),
-                st["tree"][:24].ljust(24),
+                elide_name(st["repo"], 24).ljust(24),
+                elide_name(st["tree"], 24).ljust(24),
                 work(st).ljust(5),
                 drift(st).ljust(5),
                 subject,
             ))
         else:
-            lines.append(c("  %s  %s" % (name[:24].ljust(24), "..."), DIM))
+            lines.append(c("  %s  %s" % (elide_name(name, 24).ljust(24),
+                                         G["ellipsis"]), DIM))
     done = sum(1 for s in ordered if s)
     lines.append("")
     lines.append("%d of %d tree(s) scanned" % (done, len(paths)))
@@ -1043,8 +1207,7 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
             if st["conflicts"]:
                 subject += ", %d conflict(s)" % st["conflicts"]
             subject += " **"
-        if len(subject) > subject_w:
-            subject = subject[: subject_w - 3] + "..."
+        subject = elide(subject, subject_w)
         body_cells = [row[i].ljust(widths[i]) for i in range(len(columns))]
         is_changed = bool(changed) and st["path"] in changed
         is_cursor = cursor is not None and row_i == cursor
@@ -1201,9 +1364,7 @@ def render_log(states, limit, width=160, height=None):
         "SHA".ljust(7), "AUTHOR".ljust(w_author), "SUBJECT",
     )), BOLD)]
     for r in merged:
-        subject = ascii_safe(r["subject"])
-        if len(subject) > subject_w:
-            subject = subject[: subject_w - 3] + "..."
+        subject = elide(ascii_safe(r["subject"]), subject_w)
         lines.append("  ".join((
             dur(now - r["ts"]).ljust(4),
             r["repo"].ljust(w_repo),
@@ -1268,7 +1429,8 @@ def detail_lines(st, width=160, height=None):
             for dl in diff_lines[:30]:
                 lines.append("  " + ascii_safe(dl))
             if len(diff_lines) > 30:
-                lines.append(c("  ... %d more line(s)" % (len(diff_lines) - 30),
+                lines.append(c("  %s %d more line(s)"
+                               % (G["ellipsis"], len(diff_lines) - 30),
                                YELLOW))
     lines.append("")
 
@@ -1284,7 +1446,9 @@ def detail_lines(st, width=160, height=None):
                 ascii_safe(r["subject"])))
     lines.append("")
     lines.append(c("any other key returns to the table", DIM))
-    return clip_to_height(lines, height, 0)
+    # The one bounded region on the board gets the dialect's frame; the ASCII
+    # dialect returns exactly the clipped lines this always returned.
+    return overlay_frame(lines, "detail", width, height)
 
 
 # ---------------------------------------------------------------- github (gh)
@@ -1465,17 +1629,20 @@ def github_cell(s):
     """PR column: '#123', '#123+' success, '#123x' failure, '#123~' pending,
     '#123 draft', or blank when there is no open PR.
 
-    ASCII on purpose, not the checkmark/cross this might otherwise reach for --
-    ascii_safe() exists a few hundred lines up because the Windows console
-    codepage mangles exactly that kind of glyph mid-table, and this column
-    should not need its own escape hatch from the same problem.
+    The CI mark comes from the active dialect table: `✓`/`✗`/`○` in the
+    Unicode tier, and the `+`/`x`/`~` this column has always printed
+    everywhere ASCII holds -- which is every pipe-safe surface, because the
+    dialect is only ever switched for an interactive watch session whose
+    terminal probed UTF-8-capable. The Windows-codepage mangling that kept
+    this column ASCII-only is that legacy console, and it fails the probe.
     """
     n = s.get("pr_number")
     if not n:
         return ""
     if s.get("pr_draft"):
         return "#%d draft" % n
-    mark = {"success": "+", "failure": "x", "pending": "~"}.get(s.get("pr_ci"), "")
+    mark = {"success": G["ok"], "failure": G["fail"],
+            "pending": G["pending"]}.get(s.get("pr_ci"), "")
     return "#%d%s" % (n, mark)
 
 
@@ -1530,7 +1697,10 @@ DISPLAY_HELP = (
     ("ACTIVE", "committed within the last hour"),
     ("QUIET", "in sync and idle; collapsed to one line unless expanded (a)"),
     ("WORK", "tracked changes, +N? untracked (12+3? = 12 tracked, 3 untracked)"),
-    ("DRIFT", "vs base: = in sync, ^2 ahead, v3 behind, ^2v3 diverged, - unknown"),
+    # %(up)s / %(down)s: the drift marks are dialect glyphs, and a help view
+    # describing `^2` while the table renders `↑2` would be a mixed frame.
+    ("DRIFT", "vs base: = in sync, %(up)s2 ahead, %(down)s3 behind, "
+              "%(up)s2%(down)s3 diverged, - unknown"),
     ("STASH", "stash count for the repo"),
     ("@sha", "detached HEAD; commits here land on no branch"),
     ("*", "row changed since the last frame   >  cursor row"),
@@ -1755,7 +1925,9 @@ def help_lines():
     # ignoring them -- so the overlay reads the same way the table does.
     d_width = max(len(k) for k, _ in DISPLAY_HELP)
     out += ["", c("READING THE TABLE", BOLD), ""]
-    out += ["  %s   %s" % (c(k.ljust(d_width), BOLD), desc)
+    out += ["  %s   %s" % (c(k.ljust(d_width), BOLD),
+                           desc % {"up": G["up"], "down": G["down"]}
+                           if "%(" in desc else desc)
             for k, desc in DISPLAY_HELP]
     out += ["", c("any other key returns to the table", DIM)]
     return out
@@ -1956,7 +2128,7 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
         out = [json_document(states, getattr(args, "legacy_json", False))]
         shown = []
     elif helping:
-        out = clip_to_height(help_lines(), body_h, 0)
+        out = overlay_frame(help_lines(), "help", width, body_h)
         shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
     elif pending is not None:
         paths, ordered = pending
@@ -2189,6 +2361,11 @@ def build_parser():
                     help="with --json, emit the bare pre-0.6 list of records "
                          "instead of the envelope")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
+    ap.add_argument("--ascii", action="store_true",
+                    help="force the ASCII glyph dialect in watch mode (the "
+                         "Unicode tier is otherwise used when stdout is an "
+                         "interactive UTF-8 terminal; GIT_ROOST_ASCII=1 does "
+                         "the same. Pipe-safe output is always ASCII)")
     ap.add_argument("--github", action="store_true",
                     help="add a PR/CI column via `gh` (opt-in: network calls, "
                          "needs gh on PATH and authenticated; silently omitted "
@@ -2274,6 +2451,7 @@ _arguments -S \\
   '--fail-on[exit 1 on this condition]:condition:(none dirty diverged stuck)' \\
   '--json[emit records as JSON]' \\
   '--no-color[disable colour output]' \\
+  '--ascii[force the ASCII glyph dialect in watch mode]' \\
   '--github[add a PR/CI column via gh]' \\
   '--github-interval[PR/CI refresh interval in watch mode]:seconds:' \\
   '--print-completion[print a shell completion script]:shell:(bash zsh powershell)'
@@ -2340,6 +2518,15 @@ def main(argv=None):
             "git-roost: no VT console (cannot redraw in place); "
             "rendering once. Use Windows Terminal, or pass --once.\n")
         args.watch = None
+
+    # Which glyph dialect renders is the terminal's decision, probed once and
+    # held for the session -- and only an interactive watch session ever gets
+    # the Unicode tier. One-shot, piped and --json output is unconditionally
+    # ASCII (args.watch is already None on every one of those paths), which is
+    # what keeps `git-roost | less`, `--json | jq` and every existing consumer
+    # byte-identical to what they always got. Set explicitly on both paths so
+    # a long-lived process can never leak one mode's table into the other.
+    set_dialect(bool(args.watch) and not args.ascii and unicode_capable())
 
     # NO_COLOR is the community convention (https://no-color.org) and costs
     # nothing to honour. It suppresses colour only -- a user who wants plain

@@ -2314,5 +2314,200 @@ class TestNarrowRender(unittest.TestCase):
             self.assertIn(h, header)
 
 
+class TestUnicodeDialect(unittest.TestCase):
+    """The Unicode glyph tier: probed once at startup, watch-mode only.
+
+    Two dialects, one vocabulary -- the semantics of every slot are identical,
+    only the codepoints differ, and a frame must never mix them. Pipe-safe
+    output (--once, --json, anything non-interactive) is always the ASCII
+    dialect: every other test in this file runs on the module default and
+    asserts those exact bytes, which is itself the byte-identity guarantee.
+    """
+
+    def tearDown(self):
+        # The dialect is module state; a test that switched it must not leak
+        # Unicode into the ASCII assertions the rest of the file makes.
+        git_roost.set_dialect(False)
+
+    @staticmethod
+    def stream(tty=True, encoding="utf-8"):
+        s = mock.Mock()
+        s.isatty.return_value = tty
+        s.encoding = encoding
+        return s
+
+    # ------------------------------------------------------------- the probe
+
+    def test_probe_accepts_an_interactive_utf8_stdout(self):
+        for enc in ("utf-8", "UTF-8", "utf8", "utf_8"):
+            self.assertTrue(git_roost.unicode_capable(
+                stream=self.stream(encoding=enc), env={}), enc)
+
+    def test_probe_rejects_a_legacy_codepage_console(self):
+        # The historical "block drawing mojibakes on Windows" console: a TTY,
+        # but its codepage cannot render the tier.
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(encoding="cp1252"), env={}))
+
+    def test_probe_rejects_a_pipe_even_when_utf8(self):
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(tty=False), env={}))
+
+    def test_probe_env_override_forces_ascii(self):
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(), env={"GIT_ROOST_ASCII": "1"}))
+
+    def test_non_watch_main_always_resets_to_ascii(self):
+        # A leaked Unicode table from an earlier watch session in the same
+        # process must not reach one-shot output: main() sets the dialect on
+        # every path, and non-watch paths set it to ASCII unconditionally.
+        git_roost.set_dialect(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+                git_roost.main(["--once", "--root", tmp])
+        self.assertIs(git_roost.G, git_roost.ASCII_GLYPHS)
+        self.assertTrue(all(ord(ch) < 128 for ch in buf.getvalue()))
+
+    @needs_git
+    def test_oneshot_output_carries_no_unicode_even_from_a_utf8_stdout(self):
+        # The dialect is watch-only: even on a box whose stdout would pass the
+        # probe, a piped/one-shot render is byte-identical ASCII.
+        git_roost.set_dialect(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "r")
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+                git_roost.main(["--once", "--root", tmp, "--no-color"])
+            out = buf.getvalue()
+        self.assertIn("r", out)
+        self.assertTrue(all(ord(ch) < 128 for ch in out), repr(out))
+
+    # ------------------------------------------------------ glyphs per dialect
+
+    def test_drift_cell_in_both_dialects(self):
+        st = {"base": "origin/main", "ahead": 2, "behind": 3}
+        self.assertEqual(git_roost.drift(st), "^2v3")
+        git_roost.set_dialect(True)
+        self.assertEqual(git_roost.drift(st), "↑2↓3")  # up-2 down-3
+        # `=` and `-` are already both dialects' spelling.
+        self.assertEqual(git_roost.drift(
+            {"base": "origin/main", "ahead": 0, "behind": 0}), "=")
+        self.assertEqual(git_roost.drift({"base": "", "ahead": None}), "-")
+
+    def test_github_cell_in_both_dialects(self):
+        cases = {"success": ("+", "✓"), "failure": ("x", "✗"),
+                 "pending": ("~", "○")}
+        for ci, (a_mark, u_mark) in cases.items():
+            s = {"pr_number": 7, "pr_draft": False, "pr_ci": ci}
+            git_roost.set_dialect(False)
+            self.assertEqual(git_roost.github_cell(s), "#7" + a_mark)
+            git_roost.set_dialect(True)
+            self.assertEqual(git_roost.github_cell(s), "#7" + u_mark)
+
+    def test_work_cell_stays_ascii_in_the_unicode_dialect(self):
+        # The WORK cell is the pipe-safe git vocabulary shared across the
+        # flock -- identical in both dialects by design.
+        git_roost.set_dialect(True)
+        cell = git_roost.work(state(tracked=12, untracked=3))
+        self.assertEqual(cell, "12+3?")
+
+    def test_truncation_marker_in_both_dialects(self):
+        lines = ["head"] + ["row %d" % i for i in range(30)] + ["summary"]
+        out = git_roost.clip_to_height(lines, 6, focus=1)
+        self.assertIn("... ", "\n".join(out))
+        git_roost.set_dialect(True)
+        out = git_roost.clip_to_height(lines, 6, focus=1)
+        joined = "\n".join(out)
+        self.assertIn("… ", joined)          # ellipsis + N more
+        self.assertIn("more below  (j)", joined)  # still key-named
+        self.assertNotIn("...", joined)           # no mixed frames
+
+    def test_elide_uses_the_dialect_mark(self):
+        self.assertEqual(git_roost.elide("abcdefgh", 6), "abc...")
+        self.assertEqual(git_roost.elide("abc", 6), "abc")
+        git_roost.set_dialect(True)
+        self.assertEqual(git_roost.elide("abcdefgh", 6), "abcde…")
+
+    def test_elide_name_keeps_both_ends_in_unicode(self):
+        name = "wings/standardization-a1b2"
+        self.assertEqual(git_roost.elide_name(name, 12), name[:12])
+        git_roost.set_dialect(True)
+        out = git_roost.elide_name(name, 12)
+        self.assertEqual(len(out), 12)
+        self.assertTrue(out.startswith("wings/"))
+        self.assertTrue(out.endswith("a1b2"))
+        self.assertIn("…", out)
+        # A fitting name is untouched in both dialects.
+        self.assertEqual(git_roost.elide_name("short", 12), "short")
+
+    def test_ascii_safe_strips_data_but_not_dialect_glyphs(self):
+        # Commit subjects stay stripped in both dialects -- prose is unvetted
+        # -- but the active table's own glyphs must survive.
+        git_roost.set_dialect(True)
+        self.assertEqual(git_roost.ascii_safe("a—b"), "a?b")
+        marks = "↑2↓3 … ✓✗○"
+        self.assertEqual(git_roost.ascii_safe(marks), marks)
+        git_roost.set_dialect(False)
+        self.assertEqual(git_roost.ascii_safe("↑…"), "??")
+
+    # -------------------------------------------------------------- the frame
+
+    def test_overlay_frame_is_a_noop_in_ascii(self):
+        lines = ["KEYS", "", "  q   quit"]
+        self.assertEqual(git_roost.overlay_frame(lines, "help", 80, None), lines)
+
+    def test_detail_overlay_is_framed_in_unicode(self):
+        git_roost.set_dialect(True)
+        st = renderable(repo="wings", tree="t")
+        with mock.patch.object(git_roost, "git", return_value=None):
+            out = git_roost.detail_lines(st, width=60, height=20)
+        self.assertTrue(out[0].startswith("╭─ DETAIL ─"))
+        self.assertTrue(out[0].endswith("╮"))
+        self.assertTrue(out[-1].startswith("╰"))
+        self.assertTrue(out[-1].endswith("╯"))
+        for line in out[1:-1]:
+            self.assertTrue(line.startswith("│ "), repr(line))
+            self.assertTrue(line.endswith(" │"), repr(line))
+        # Every row paints the same visible width -- a ragged right border is
+        # the classic len()-vs-visible-length bug.
+        widths = {git_roost.visible_len(line) for line in out}
+        self.assertEqual(len(widths), 1, widths)
+
+    def test_detail_overlay_is_flat_in_ascii(self):
+        st = renderable(repo="wings", tree="t")
+        with mock.patch.object(git_roost, "git", return_value=None):
+            out = git_roost.detail_lines(st, width=60, height=20)
+        self.assertTrue(all(ord(ch) < 128 for ch in "\n".join(out)))
+        self.assertNotIn("╭", out[0])
+
+    def test_help_overlay_is_framed_in_unicode_and_unmixed(self):
+        git_roost.set_dialect(True)
+        out = git_roost.overlay_frame(git_roost.help_lines(), "help", 80, 40)
+        self.assertTrue(out[0].startswith("╭─ HELP ─"))
+        joined = "\n".join(out)
+        # The DRIFT legend speaks the dialect on screen -- describing `^2`
+        # under a table that renders an up-arrow would be a mixed frame.
+        self.assertIn("↑2", joined)
+        self.assertNotIn("^2", joined)
+
+    def test_help_legend_is_ascii_in_ascii(self):
+        out = "\n".join(git_roost.help_lines())
+        self.assertIn("^2", out)
+        self.assertTrue(all(ord(ch) < 128 for ch in out))
+
+    def test_frame_respects_the_height_budget(self):
+        git_roost.set_dialect(True)
+        lines = ["title"] + ["row %d" % i for i in range(50)] + ["foot"]
+        out = git_roost.overlay_frame(lines, "detail", 60, 12)
+        self.assertLessEqual(len(out), 12)
+
+    def test_frame_never_writes_into_the_last_column(self):
+        git_roost.set_dialect(True)
+        out = git_roost.overlay_frame(["x" * 200], "detail", 60, 10)
+        for line in out:
+            self.assertLessEqual(git_roost.visible_len(line), 59, repr(line))
+
+
 if __name__ == "__main__":
     unittest.main()
