@@ -586,6 +586,92 @@ def renderable(**kw):
     return base
 
 
+class TestWatchResize(unittest.TestCase):
+    """A window resize is relayout + repaint of the cached scan, never git.
+
+    The watch loop scans on its own clock (next_watch_event's deadline) and
+    treats a size change as its own event. These pin the two halves of that:
+    the resize event fires without waiting out the interval, and the repaint
+    path can run with subprocess disabled entirely.
+    """
+
+    class NoKeys:
+        enabled = False
+
+        def wait(self, timeout):
+            # No sleeping in tests: pretend the slice elapsed keylessly.
+            return None
+
+    def test_resize_is_reported_before_the_scan_tick(self):
+        sizes = iter([os.terminal_size((100, 30))])
+        event = git_roost.next_watch_event(
+            self.NoKeys(), deadline=time.time() + 3600,
+            size=os.terminal_size((160, 24)),
+            get_size=lambda fallback: next(sizes))
+        self.assertEqual(event, ("resize", os.terminal_size((100, 30))))
+
+    def test_tick_fires_when_the_scan_interval_has_elapsed(self):
+        event = git_roost.next_watch_event(
+            self.NoKeys(), deadline=time.time() - 1,
+            size=os.terminal_size((160, 24)),
+            get_size=lambda fallback: os.terminal_size((160, 24)))
+        self.assertEqual(event, ("tick", None))
+
+    def test_key_wins_over_an_unchanged_size(self):
+        class OneKey:
+            enabled = True
+
+            def wait(self, timeout):
+                return "j"
+
+        event = git_roost.next_watch_event(
+            OneKey(), deadline=time.time() + 3600,
+            size=os.terminal_size((160, 24)),
+            get_size=lambda fallback: os.terminal_size((160, 24)))
+        self.assertEqual(event, ("key", "j"))
+
+    def test_settle_resize_coalesces_a_drag_burst(self):
+        # Windows Terminal streams intermediate sizes during a drag; the
+        # settle loop must ride it out and answer with the final shape.
+        sizes = iter([os.terminal_size((150, 24)), os.terminal_size((120, 20)),
+                      os.terminal_size((120, 20))])
+        settled = git_roost.settle_resize(
+            os.terminal_size((160, 24)),
+            get_size=lambda fallback: next(sizes), sleep=lambda s: None)
+        self.assertEqual(settled, os.terminal_size((120, 20)))
+
+    def test_resize_repaint_runs_no_subprocess(self):
+        # The point of the scan/repaint split: rendering a frame at a new
+        # width from already-scanned states must never reach for git (or gh).
+        # Disable subprocess at the module level and repaint at three widths,
+        # including one narrow enough to trigger column shedding.
+        states = [renderable(repo="alpha", last_ts=1),
+                  renderable(tracked=3, repo="beta", last_ts=1)]
+        view = {"sort": "recent", "filter": "all", "quiet": True,
+                "log": False, "log_limit": 25, "cursor": 0, "detail": None,
+                "github": False, "note": None, "page": 10}
+
+        class Args:
+            json = False
+            legacy_json = False
+            github = False
+            watch = 3.0
+
+        def boom(*a, **kw):
+            raise AssertionError("repaint ran a subprocess")
+
+        with mock.patch.object(git_roost.subprocess, "run", boom), \
+                mock.patch.object(git_roost.subprocess, "Popen", boom):
+            for width, height in ((160, 40), (100, 30), (46, 12)):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    shown = git_roost.draw_watch_frame(
+                        True, width, height, view, Args(), False, states,
+                        set())
+                self.assertTrue(buf.getvalue())
+                self.assertEqual(len(shown), 2)
+
+
 class TestSortModes(unittest.TestCase):
     """Sorting cycles within a group, never across one.
 
@@ -759,10 +845,15 @@ class TestWatchKeys(unittest.TestCase):
         self.assertEqual(lower, upper)
         self.assertEqual(git_roost.apply_key(upper, "Q"), "quit")
 
-    def test_r_and_unbound_keys_change_nothing(self):
-        # 'r' is a redraw, which the loop does anyway on falling through. The
-        # test exists so a future edit cannot quietly give it a side effect.
-        for key in ("r", "R", "x", "5", " "):
+    def test_r_requests_a_rescan_and_unbound_keys_change_nothing(self):
+        # Every other key repaints the cached fleet; 'r' is the one that may
+        # reach for git, and it must say so via its return value or the loop
+        # would serve it the same cache. Neither touches the view dict.
+        for key in ("r", "R"):
+            view = {"sort": "repo", "filter": "dirty", "quiet": True}
+            self.assertEqual(git_roost.apply_key(view, key), "rescan")
+            self.assertEqual(view, {"sort": "repo", "filter": "dirty", "quiet": True})
+        for key in ("x", "5", " "):
             view = {"sort": "repo", "filter": "dirty", "quiet": True}
             self.assertIsNone(git_roost.apply_key(view, key))
             self.assertEqual(view, {"sort": "repo", "filter": "dirty", "quiet": True})

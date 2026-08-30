@@ -1650,6 +1650,67 @@ class Keys:
         return ANSI_NAV_KEYS.get(seq)
 
 
+# How often the watch loop checks the terminal shape while it waits for a key
+# or the next scan tick. A resize repaints (cached data, no git) within this
+# window, so it must be small; it is also the idle wake-up rate, so it must
+# not be zero.
+WATCH_POLL = 0.25
+# Windows Terminal reports a stream of intermediate sizes during a drag.
+# settle_resize waits for two identical consecutive reads (RESIZE_SETTLE
+# apart) before repainting, and gives up waiting after RESIZE_SETTLE_MAX so a
+# long slow drag still sees the table track it.
+RESIZE_SETTLE = 0.05
+RESIZE_SETTLE_MAX = 0.30
+
+
+def next_watch_event(keys, deadline, size, get_size=None, clock=None):
+    """Block until the watch loop owes a frame, and say why.
+
+    Returns ("key", ch), ("resize", new_size) or ("tick", None). The wait
+    happens in WATCH_POLL slices with a terminal-size check between them, so
+    a resize triggers a repaint of the already-scanned fleet within a
+    fraction of a second -- scanning stays on its own clock (`deadline`,
+    which is last scan + interval). This is the reason a resize is cheap:
+    the answer to "the terminal changed shape" is relayout + repaint, never
+    a rescan. get_size/clock are injectable for the tests; the loop passes
+    neither.
+    """
+    get_size = get_size or shutil.get_terminal_size
+    clock = clock or time.time
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return ("tick", None)
+        key = keys.wait(min(WATCH_POLL, remaining))
+        if key is not None:
+            return ("key", key)
+        cur = get_size((160, 24))
+        if (cur.columns, cur.lines) != (size.columns, size.lines):
+            return ("resize", cur)
+
+
+def settle_resize(size, get_size=None, sleep=None):
+    """Let a resize burst finish before the repaint.
+
+    A drag emits dozens of sizes; repainting each one would chase the mouse.
+    Wait until two consecutive reads agree (or RESIZE_SETTLE_MAX passes,
+    whichever is first) so one paint lands at the final shape. Returns the
+    settled size. No git runs here -- this is purely about when to repaint
+    what is already known.
+    """
+    get_size = get_size or shutil.get_terminal_size
+    sleep = sleep or time.sleep
+    deadline = time.time() + RESIZE_SETTLE_MAX
+    cur = size
+    while time.time() < deadline:
+        sleep(RESIZE_SETTLE)
+        nxt = get_size((160, 24))
+        if (nxt.columns, nxt.lines) == (cur.columns, cur.lines):
+            break
+        cur = nxt
+    return cur
+
+
 def help_lines():
     width = max(len(k) for k, _ in KEYMAP)
     out = [c("KEYS", BOLD), ""]
@@ -1753,9 +1814,13 @@ def apply_key(view, key, shown=None):
             cursor = max(0, min(view.get("cursor", 0), len(shown) - 1))
             view["cursor"] = cursor
             view["detail"] = shown[cursor]
-    # 'r' -- and any unbound key -- falls through to an immediate redraw, which
-    # is what refresh means here: the scan happens on the next line of the loop,
-    # not behind a cache.
+    elif key in ("r", "R"):
+        # The one key that reaches for git. Every other key above re-renders
+        # the cached fleet, so "refresh now" has to say so explicitly or the
+        # watch loop would serve it the same cache.
+        return "rescan"
+    # Any unbound key falls through to an immediate repaint of the cached
+    # fleet -- relayout only, no scan.
     return None
 
 
@@ -2318,6 +2383,9 @@ def main(argv=None):
             sys.stdout.flush()
         with Keys() as keys:
             shown = []
+            changed = set()
+            scan_now = True
+            last_scan = 0.0
             while True:
                 size = shutil.get_terminal_size((160, 24))
                 width = size.columns
@@ -2325,62 +2393,95 @@ def main(argv=None):
                 # What pgup/pgdn mean this frame: the body rows the terminal
                 # can show (status line + table header + summary trimmed off).
                 view["page"] = max(1, height - 4)
-                spin_n = [0]
-                last_paint = [0.0]
 
-                def on_progress(done, total, ordered, paths):
-                    now = time.time()
-                    if done < total and now - last_paint[0] < 0.12:
-                        return
-                    last_paint[0] = now
-                    loading = "scanning %d/%d %s" % (
-                        done, total, SPIN[spin_n[0] % 4])
-                    spin_n[0] += 1
-                    if last_states:
-                        # Keep the last grouped table; only the status line
-                        # ticks. Redrawing the body every worker finish is
-                        # what flashed and jumped.
-                        if ansi:
-                            rewrite_status(width, view, args, loading)
-                        return
-                    draw_watch_frame(
-                        ansi, width, height, view, args, helping, [],
-                        {}, loading=loading, pending=(paths, ordered))
+                # Scanning runs git across the whole fleet; repainting is
+                # string work on the previous scan. Only the interval tick and
+                # the `r` key pay for the former -- a resize or any other
+                # keypress re-renders last_states at the current shape, which
+                # is what keeps a window drag instant.
+                scanned = scan_now
+                if scan_now:
+                    scan_now = False
+                    spin_n = [0]
+                    last_paint = [0.0]
 
-                states = scan(
-                    args, on_progress=None if args.json else on_progress)
-                last_states = states
+                    def on_progress(done, total, ordered, paths):
+                        now = time.time()
+                        if done < total and now - last_paint[0] < 0.12:
+                            return
+                        last_paint[0] = now
+                        loading = "scanning %d/%d %s" % (
+                            done, total, SPIN[spin_n[0] % 4])
+                        spin_n[0] += 1
+                        if last_states:
+                            # Keep the last grouped table; only the status line
+                            # ticks. Redrawing the body every worker finish is
+                            # what flashed and jumped.
+                            if ansi:
+                                rewrite_status(width, view, args, loading)
+                            return
+                        draw_watch_frame(
+                            ansi, width, height, view, args, helping, [],
+                            {}, loading=loading, pending=(paths, ordered))
+
+                    last_states = scan(
+                        args, on_progress=None if args.json else on_progress)
+                    last_scan = time.time()
 
                 if args.json:
                     shown = draw_watch_frame(
-                        ansi, width, height, view, args, helping, states, {})
+                        ansi, width, height, view, args, helping, last_states,
+                        {})
                 else:
                     if view["github"]:
                         now = time.time()
-                        due = now - last_gh_fetch >= args.github_interval or not github_map
+                        # The interval clock only ticks on scan frames -- a
+                        # resize repaint must never be the thing that runs
+                        # `gh`. The empty-map escape stays so the `g` toggle
+                        # fills its column without waiting out the interval.
+                        due = ((scanned and
+                                now - last_gh_fetch >= args.github_interval)
+                               or not github_map)
                         if due:
-                            github_map = github_facts_map(states)
+                            github_map = github_facts_map(last_states)
                             last_gh_fetch = now
-                        apply_github_facts(states, github_map)
+                        apply_github_facts(last_states, github_map)
 
-                    cur_sig = {s["path"]: frame_signature(s) for s in states}
-                    changed = {p for p, sig in cur_sig.items()
-                               if p in prev_sig and prev_sig[p] != sig}
-                    prev_sig = cur_sig
+                    if scanned:
+                        # "What moved" is a fact about consecutive scans, not
+                        # consecutive paints: a repaint keeps the previous
+                        # scan's highlights instead of wiping them.
+                        cur_sig = {s["path"]: frame_signature(s)
+                                   for s in last_states}
+                        changed = {p for p, sig in cur_sig.items()
+                                   if p in prev_sig and prev_sig[p] != sig}
+                        prev_sig = cur_sig
                     shown = draw_watch_frame(
-                        ansi, width, height, view, args, helping, states,
+                        ansi, width, height, view, args, helping, last_states,
                         changed)
 
                 # The help overlay waits for a key rather than timing out under
                 # the reader. A keymap that vanished after 3s would be gone at
                 # exactly the moment someone was reading it.
-                key = keys.wait(3600 if helping and keys.enabled else args.watch)
-                if key is None:
+                if helping and keys.enabled:
+                    deadline = time.time() + 3600
+                else:
+                    deadline = last_scan + args.watch
+                event, payload = next_watch_event(keys, deadline, size)
+                if event == "resize":
+                    # Relayout + repaint of cached data only; the scan stays
+                    # on its own clock. settle_resize coalesces the burst a
+                    # drag emits so one paint lands at the final size.
+                    settle_resize(payload)
+                    continue
+                if event == "tick":
+                    scan_now = True
                     # A note has now been on screen for a full interval --
                     # long enough to have confirmed the keypress. Let it fade
                     # rather than sit there going stale.
                     view["note"] = None
                     continue
+                key = payload
                 if helping:
                     helping = False
                     continue
@@ -2396,6 +2497,8 @@ def main(argv=None):
                 action = apply_key(view, key, shown=shown)
                 if action == "quit":
                     break
+                if action == "rescan":
+                    scan_now = True
                 helping = action == "help"
     except KeyboardInterrupt:
         pass
