@@ -136,14 +136,53 @@ YELLOW = "\033[33m"
 BLUE = "\033[34m"
 CYAN = "\033[36m"
 MAGENTA = "\033[35m"
+# xterm-256 index 12: plain ANSI blue (4) is illegible on the common dark
+# palettes, so identity color asks for the bright one wherever the terminal
+# reports 256 colors -- see blue_for_terminal().
+BRIGHT_BLUE = "\033[38;5;12m"
+# Selection is the one painted background on the board: black on cyan.
+SELECTED = "\033[30;46m"
 
 COLOR = False
+
+# The identity color -- repo names, always paired with BOLD so 8-color
+# terminals brighten it. Resolved once in main() because which blue is legible
+# depends on the terminal, not the data; module default keeps headless callers
+# (tests, --json) on the safe plain form.
+IDENT = BLUE
+
+
+def blue_for_terminal(env=None):
+    """BRIGHT_BLUE where the terminal reports 256 colors, else plain BLUE.
+
+    TERM is the honest signal on POSIX; Windows Terminal never sets it but
+    always sets WT_SESSION, and COLORTERM is the truthy convention for
+    everything else that renders more than 16 colors.
+    """
+    env = os.environ if env is None else env
+    if "256color" in (env.get("TERM") or "") or env.get("COLORTERM") \
+            or env.get("WT_SESSION"):
+        return BRIGHT_BLUE
+    return BLUE
 
 
 def c(text, *codes):
     if not COLOR or not codes:
         return text
     return "".join(codes) + text + RESET
+
+
+def paint_over(text, *codes):
+    """Paint a whole row, re-arming after every inner reset.
+
+    A row can carry its own cell-level color (the REPO cell); a plain outer
+    wrap would let that cell's RESET switch the rest of the row back to
+    default, which for the selection background means a half-painted bar.
+    """
+    if not COLOR or not codes:
+        return text
+    arm = "".join(codes)
+    return arm + text.replace(RESET, RESET + arm) + RESET
 
 
 def ascii_safe(s):
@@ -547,7 +586,10 @@ def tree_state(path):
             if len(parts) == 2 and all(p.isdigit() for p in parts):
                 st["ahead"], st["behind"] = int(parts[0]), int(parts[1])
 
-    last = git(path, "log", "-1", "--format=%ct%x00%h%x00%an%x00%s")
+    # %at, not %ct: a rebase rewrites every committer date, and a tool whose
+    # top bucket is literally "stuck mid-rebase" must not call a freshly
+    # rebased tree freshly worked-in. The author date is the honest age.
+    last = git(path, "log", "-1", "--format=%at%x00%h%x00%an%x00%s")
     if last:
         bits = last.split("\0")
         if len(bits) == 4 and bits[0].isdigit():
@@ -614,7 +656,13 @@ def bucket(st, now=None):
     return 6, "QUIET"
 
 
-BUCKET_COLORS = {0: RED, 1: RED, 2: YELLOW, 3: YELLOW, 4: BLUE, 5: GREEN, 6: DIM}
+# Colors by semantic role, not by bucket rank (the leghorn design language):
+# red is failure -- only a tree genuinely stuck mid-operation earns it;
+# magenta is divergence -- DIVERGED and BEHIND are both positions against a
+# base, not emergencies; yellow is attention (uncommitted or unpushed work
+# wants a human eventually); green is live. Blue is reserved for identity
+# (repo names), which is why no bucket takes it.
+BUCKET_COLORS = {0: RED, 1: MAGENTA, 2: YELLOW, 3: YELLOW, 4: MAGENTA, 5: GREEN, 6: DIM}
 
 
 def work(st):
@@ -698,6 +746,11 @@ COLUMNS = (
     ("STASH", lambda s: str(s["stashes"]) if s["stashes"] else ""),
     ("LAST", lambda s: dur(time.time() - s["last_ts"]) if s["last_ts"] else "-"),
 )
+
+# What render() drops, in order, when the terminal is too narrow for the full
+# table: the stash count first (a repo-level nicety), then the branch (the
+# DRIFT base usually implies it), then the tree name, and DRIFT only last.
+COLUMN_SHED_ORDER = ("STASH", "BRANCH", "TREE", "DRIFT")
 
 
 def visible_rows(states, expand_quiet=False, sort_mode="recent", filt="all"):
@@ -841,10 +894,13 @@ def clip_to_height(lines, height, focus=0):
     window = inner[start:start + inner_h]
     above = start
     below = len(inner) - start - len(window)
+    # Attention-colored, not dim: silent truncation is a lie, and a cut list
+    # must name the way to the rest as loudly as anything else asking for a
+    # human -- the key names stay, they are the remedy.
     if above and window:
-        window[0] = c("  ... %d more above  (k)" % above, DIM)
+        window[0] = c("  ... %d more above  (k)" % above, YELLOW)
     if below and window:
-        window[-1] = c("  ... %d more below  (j)" % below, DIM)
+        window[-1] = c("  ... %d more below  (j)" % below, YELLOW)
     return [header] + window + [footer]
 
 
@@ -923,15 +979,27 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
     # never passes --github.
     columns = COLUMNS + (GITHUB_COLUMN,) if github else COLUMNS
 
-    cells = [[fn(s) for _, fn in columns] for s in shown]
-    headers = [h for h, _ in columns]
-    widths = [
-        max([len(headers[i])] + [row[i] and len(row[i]) or 0 for row in cells] or [0])
-        for i in range(len(columns))
-    ]
+    # Degradation is designed, not overflowed: below the width the full table
+    # needs, columns drop in the stated order until the subject fits again,
+    # instead of every row wrapping. REPO, WORK and LAST are never shed --
+    # who, how dirty, and how stale is the irreducible answer.
+    to_shed = list(COLUMN_SHED_ORDER)
+    while True:
+        cells = [[fn(s) for _, fn in columns] for s in shown]
+        headers = [h for h, _ in columns]
+        widths = [
+            max([len(headers[i])] + [row[i] and len(row[i]) or 0 for row in cells] or [0])
+            for i in range(len(columns))
+        ]
+        used = sum(widths) + 2 * len(widths) + 2
+        if width - used - 2 >= 20 or not to_shed:
+            break
+        drop = to_shed.pop(0)
+        columns = tuple(col for col in columns if col[0] != drop)
 
-    used = sum(widths) + 2 * len(widths) + 2
-    subject_w = max(20, width - used - 2)
+    # The floor keeps a sliver of subject alive even at 40 columns; anything
+    # wider than the terminal would wrap into the next row's margin.
+    subject_w = max(8, width - used - 2)
 
     lines = []
     lines.append(c("  " + "  ".join(
@@ -956,7 +1024,7 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
             subject += " **"
         if len(subject) > subject_w:
             subject = subject[: subject_w - 3] + "..."
-        body = "  ".join(row[i].ljust(widths[i]) for i in range(len(columns)))
+        body_cells = [row[i].ljust(widths[i]) for i in range(len(columns))]
         is_changed = bool(changed) and st["path"] in changed
         is_cursor = cursor is not None and row_i == cursor
         if is_cursor:
@@ -966,11 +1034,23 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
             marker = "* "
         else:
             marker = "  "
-        line = marker + body + "  " + subject
+        if not is_cursor:
+            # Identity role: the repo name is the one thing every row is
+            # about, so the REPO cell renders bright blue + bold. The cursor
+            # row skips it -- a blue foreground inside the selection bar
+            # would fight the black-on-cyan paint for no information.
+            body_cells[0] = c(body_cells[0], IDENT, BOLD)
+        line = marker + "  ".join(body_cells) + "  " + subject
         if is_cursor:
-            line = c(line, BOLD, CYAN)
+            # The one painted background on the board. paint_over re-arms
+            # after any inner reset so a colored cell cannot cut the bar.
+            line = paint_over(line, SELECTED)
         elif is_changed:
-            line = c(line, MAGENTA, BOLD)
+            # "Changed since last frame" is liveness, not divergence: bold
+            # alone (plus the colorless * marker) says it without stealing
+            # magenta from the DIVERGED/BEHIND groups or yellow from the
+            # attention role.
+            line = paint_over(line, BOLD)
         lines.append(line)
         row_i += 1
 
@@ -1031,7 +1111,9 @@ def json_document(states, legacy=False):
 # ---------------------------------------------------------------- commit feed
 
 def commits_for(st, limit):
-    out = git(st["path"], "log", "-%d" % limit, "--format=%ct%x00%h%x00%an%x00%s")
+    # %at for the same reason tree_state uses it: author date survives a
+    # rebase, committer date does not.
+    out = git(st["path"], "log", "-%d" % limit, "--format=%at%x00%h%x00%an%x00%s")
     if not out:
         return []
     rows = []
@@ -1165,7 +1247,8 @@ def detail_lines(st, width=160, height=None):
             for dl in diff_lines[:30]:
                 lines.append("  " + ascii_safe(dl))
             if len(diff_lines) > 30:
-                lines.append("  ... %d more line(s)" % (len(diff_lines) - 30))
+                lines.append(c("  ... %d more line(s)" % (len(diff_lines) - 30),
+                               YELLOW))
     lines.append("")
 
     lines.append(c("LAST 5 COMMITS", BOLD))
@@ -1676,8 +1759,14 @@ def apply_key(view, key, shown=None):
     return None
 
 
+# What status_line() drops, in order, when the terminal is too narrow for the
+# whole line. The clock, the loading spinner and the key hints are never on
+# the list -- freshness and discoverability outrank every mode label.
+STATUS_SHED_ORDER = ("interval", "quiet", "filter", "sort", "view", "version")
+
+
 def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table",
-                loading=None, note=None):
+                loading=None, note=None, width=None):
     """The one line that says what view you are looking at.
 
     Without it a filtered table is indistinguishable from a fleet that happens
@@ -1692,18 +1781,40 @@ def status_line(sort_mode, filt, expand_quiet, interval, view_mode="table",
     The version rides along because watch mode is where "which git-roost is
     this box running" actually gets asked -- mid-session, not at a prompt
     where --version is available.
+
+    `width` sheds chips in a designed order -- see STATUS_SHED_ORDER -- so a
+    narrow terminal clips nothing by accident. The clock and the key hints
+    survive every tier: a wall display must always answer "when did this last
+    update", and `[?] keys  q quit` is the only way either key gets
+    discovered without already knowing it. None (the default) never sheds.
     """
-    bits = [
-        "git-roost v%s  %s" % (__version__, time.strftime("%H:%M:%S")),
-        "view:%s" % view_mode,
-        "sort:%s" % sort_mode,
-        "filter:%s" % FILTER_LABELS[filt],
-        "quiet:%s" % ("shown" if expand_quiet else "collapsed"),
-        "%gs" % interval,
+    chips = [
+        ("version", "git-roost v%s" % __version__),
+        ("clock", time.strftime("%H:%M:%S")),
+        ("view", "view:%s" % view_mode),
+        ("sort", "sort:%s" % sort_mode),
+        ("filter", "filter:%s" % FILTER_LABELS[filt]),
+        ("quiet", "quiet:%s" % ("shown" if expand_quiet else "collapsed")),
+        ("interval", "%gs" % interval),
     ]
     if loading:
-        bits.append(loading)
-    line = c("  ".join(bits), DIM) + c("   [?] keys", BOLD)
+        chips.append(("loading", loading))
+    hint = "[?] keys  q quit"
+
+    def fits(kept):
+        # Measured on the plain text: c() adds escapes only when COLOR is on,
+        # and a shed decision must not depend on that.
+        length = len("  ".join(text for _, text in kept)) + 3 + len(hint)
+        if note:
+            length += 3 + len(note)
+        return length <= width
+
+    if width is not None:
+        for shed in STATUS_SHED_ORDER:
+            if fits(chips):
+                break
+            chips = [chip for chip in chips if chip[0] != shed]
+    line = c("  ".join(text for _, text in chips), DIM) + c("   " + hint, BOLD)
     if note:
         line += c("   " + note, CYAN, BOLD)
     return line
@@ -1732,7 +1843,7 @@ def rewrite_status(width, view, args, loading):
         "log" if view.get("log") else "table")
     line = status_line(
         view["sort"], view["filter"], view["quiet"], args.watch,
-        view_mode, loading=loading, note=view.get("note"))
+        view_mode, loading=loading, note=view.get("note"), width=width)
     sys.stdout.write("\033[1;1H%s\033[K" % line)
     sys.stdout.flush()
 
@@ -1766,7 +1877,8 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
         "log" if view.get("log") else "table")
     frame = [status_line(
         view["sort"], view["filter"], view["quiet"], args.watch,
-        view_mode, loading=loading, note=view.get("note"))] + list(out)
+        view_mode, loading=loading, note=view.get("note"),
+        width=width)] + list(out)
     # Watch only runs when ansi is on (see main). The old "print another
     # separator + frame" else branch is what flooded a non-VT cmd every 3s.
     if not ansi:
@@ -2099,7 +2211,7 @@ Register-ArgumentCompleter -Native -CommandName git-roost -ScriptBlock {
 
 
 def main(argv=None):
-    global COLOR
+    global COLOR, IDENT
 
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -2135,6 +2247,9 @@ def main(argv=None):
     COLOR = ansi and not args.no_color and not os.environ.get("NO_COLOR")
     if args.json:
         COLOR = False
+    # Which blue is legible is a property of the terminal, so it is resolved
+    # here, once, not per cell.
+    IDENT = blue_for_terminal()
 
     problems = root_problems(resolved_roots(args))
     if problems:

@@ -1835,5 +1835,223 @@ class TestRootEnvVar(unittest.TestCase):
             self.assertEqual(out.count("initial"), 1)
 
 
+class TestDesignLanguage(unittest.TestCase):
+    """Conformance to the leghorn design language: colors by role, not rank.
+
+    Red is failure and only MID-OPERATION earns it; magenta is divergence
+    (DIVERGED and BEHIND are positions against a base, not emergencies);
+    yellow is attention; blue is reserved for identity, so no bucket may take
+    it. COLOR is off in the test process, so these patch it on where the
+    escapes themselves are the assertion.
+    """
+
+    def test_bucket_colors_map_roles_not_rank(self):
+        self.assertEqual(git_roost.BUCKET_COLORS[0], git_roost.RED)
+        self.assertEqual(git_roost.BUCKET_COLORS[1], git_roost.MAGENTA)
+        self.assertEqual(git_roost.BUCKET_COLORS[4], git_roost.MAGENTA)
+        self.assertEqual(git_roost.BUCKET_COLORS[5], git_roost.GREEN)
+        # Only genuine failure is red, and identity blue is nobody's bucket.
+        reds = [v for v in git_roost.BUCKET_COLORS.values() if v == git_roost.RED]
+        self.assertEqual(reds, [git_roost.RED])
+        self.assertNotIn(git_roost.BLUE, git_roost.BUCKET_COLORS.values())
+        self.assertNotIn(git_roost.BRIGHT_BLUE, git_roost.BUCKET_COLORS.values())
+
+    def test_repo_cell_renders_in_the_identity_color(self):
+        rows = [renderable(repo="wings", tracked=1)]
+        with mock.patch.object(git_roost, "COLOR", True):
+            out = "\n".join(git_roost.render(rows, width=200))
+        self.assertIn(git_roost.IDENT + git_roost.BOLD + "wings", out)
+
+    def test_blue_for_terminal_requests_index_12_on_256_color(self):
+        self.assertEqual(
+            git_roost.blue_for_terminal({"TERM": "xterm-256color"}),
+            git_roost.BRIGHT_BLUE)
+        self.assertEqual(
+            git_roost.blue_for_terminal({"WT_SESSION": "abc"}),
+            git_roost.BRIGHT_BLUE)
+        self.assertEqual(
+            git_roost.blue_for_terminal({"COLORTERM": "truecolor"}),
+            git_roost.BRIGHT_BLUE)
+        # A terminal that claims nothing gets the plain blue it can render.
+        self.assertEqual(git_roost.blue_for_terminal({"TERM": "vt100"}),
+                         git_roost.BLUE)
+        self.assertEqual(git_roost.blue_for_terminal({}), git_roost.BLUE)
+
+    def test_cursor_row_is_the_one_painted_background(self):
+        rows = [renderable(repo="aa", tracked=1)]
+        with mock.patch.object(git_roost, "COLOR", True):
+            out = "\n".join(git_roost.render(rows, width=200, cursor=0))
+        self.assertIn(git_roost.SELECTED, out)
+
+    def test_paint_over_rearms_after_an_inner_reset(self):
+        # A colored cell's RESET inside a selected row must not cut the
+        # selection bar short -- the paint is re-armed after every inner reset.
+        with mock.patch.object(git_roost, "COLOR", True):
+            inner = git_roost.c("wings", git_roost.BLUE)
+            out = git_roost.paint_over("a " + inner + " b", git_roost.SELECTED)
+        self.assertTrue(out.startswith(git_roost.SELECTED))
+        self.assertIn(git_roost.RESET + git_roost.SELECTED, out)
+        self.assertTrue(out.endswith(git_roost.RESET))
+
+    def test_changed_row_flashes_bold_not_magenta(self):
+        # Magenta now means divergence; the change flash is liveness, carried
+        # by bold plus the colorless * marker.
+        rows = [renderable(repo="aa", path="/p/a", tracked=1)]
+        with mock.patch.object(git_roost, "COLOR", True):
+            out = git_roost.render(rows, width=200, changed={"/p/a"})
+        row = next(l for l in out if "* " in l)
+        self.assertTrue(row.startswith(git_roost.BOLD))
+        self.assertNotIn(git_roost.MAGENTA, row)
+        self.assertNotIn(git_roost.YELLOW, row)
+
+    def test_truncation_notices_take_the_attention_color(self):
+        lines = ["HEAD"] + ["r%d" % i for i in range(20)] + ["SUM"]
+        with mock.patch.object(git_roost, "COLOR", True):
+            out = git_roost.clip_to_height(lines, 6, focus=10)
+        notices = [l for l in out if "more above" in l or "more below" in l]
+        self.assertTrue(notices)
+        for notice in notices:
+            self.assertIn(git_roost.YELLOW, notice)
+            self.assertNotIn(git_roost.DIM, notice)
+
+    def test_detail_stash_overflow_notice_is_attention_colored(self):
+        st = renderable(repo="a", tree="t", stashes=1)
+        patch = "\n".join("line %d" % i for i in range(40))
+
+        def fake_git(path, *args):
+            if args[:2] == ("stash", "list"):
+                return "stash@{0}: WIP on main"
+            if args[:2] == ("stash", "show"):
+                return patch
+            return ""
+
+        with mock.patch.object(git_roost, "git", fake_git), \
+                mock.patch.object(git_roost, "COLOR", True):
+            out = git_roost.detail_lines(st)
+        notice = next(l for l in out if "more line(s)" in l)
+        self.assertIn(git_roost.YELLOW, notice)
+
+
+class TestAuthorDates(unittest.TestCase):
+    """Ages come from the author date. A rebase rewrites every committer
+    date, and a tool whose top bucket is literally "stuck mid-rebase" must
+    not call a freshly rebased tree freshly worked-in."""
+
+    AUTHORED = 1577836800  # 2020-01-01T00:00:00Z
+
+    def commit_with_split_dates(self, repo):
+        (repo / "f.txt").write_text("x\n")
+        run(repo, "add", "f.txt")
+        env = dict(
+            os.environ,
+            GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000",
+            GIT_COMMITTER_DATE="2021-06-01T00:00:00 +0000",
+        )
+        subprocess.run(
+            ("git", "commit", "-m", "split dates"), cwd=str(repo), env=env,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    @needs_git
+    def test_tree_state_last_ts_is_the_author_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r", commit=False)
+            self.commit_with_split_dates(repo)
+            st = git_roost.tree_state(repo)
+            self.assertEqual(st["last_ts"], self.AUTHORED)
+
+    @needs_git
+    def test_commit_feed_ages_use_the_author_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp) / "r", commit=False)
+            self.commit_with_split_dates(repo)
+            st = git_roost.tree_state(repo)
+            rows = git_roost.commits_for(st, 5)
+            self.assertEqual(rows[0]["ts"], self.AUTHORED)
+
+
+class TestStatusLineShedding(unittest.TestCase):
+    """The status line sheds chips in a designed order under width pressure;
+    the clock and the quit/help hints survive every tier."""
+
+    def line(self, width=None, **kw):
+        return git_roost.status_line("recent", "all", False, 3.0,
+                                     width=width, **kw)
+
+    def test_no_width_never_sheds(self):
+        line = self.line()
+        for bit in ("view:table", "sort:recent", "filter:all",
+                    "quiet:collapsed", "3s", "v" + git_roost.__version__):
+            self.assertIn(bit, line)
+        self.assertIn("[?] keys", line)
+        self.assertIn("q quit", line)
+
+    def test_a_width_that_fits_sheds_nothing(self):
+        full = self.line()
+        self.assertEqual(self.line(width=len(full)), full)
+
+    def test_interval_is_shed_first(self):
+        line = self.line(width=len(self.line()) - 1)
+        self.assertNotIn("3s", line)
+        self.assertIn("quiet:collapsed", line)
+        self.assertIn("sort:recent", line)
+
+    def test_version_outlives_every_mode_chip(self):
+        # Wide enough for version + clock + hint only: every mode chip is
+        # shed before the version, which is last on the shed list.
+        width = (len("git-roost v%s" % git_roost.__version__) + 2 + 8 + 3
+                 + len("[?] keys  q quit"))
+        line = self.line(width=width)
+        self.assertIn("v" + git_roost.__version__, line)
+        for gone in ("view:", "sort:", "filter:", "quiet:"):
+            self.assertNotIn(gone, line)
+
+    def test_clock_and_hints_survive_the_last_tier(self):
+        line = self.line(width=40)
+        self.assertNotIn("v" + git_roost.__version__, line)
+        self.assertRegex(line, r"\d\d:\d\d:\d\d")
+        self.assertIn("[?] keys", line)
+        self.assertIn("q quit", line)
+        self.assertLessEqual(len(line), 40)
+
+
+class TestNarrowRender(unittest.TestCase):
+    """Degradation is designed, not overflowed: test at 40 columns, not 80."""
+
+    def rows(self):
+        # UNPUSHED and QUIET keep every count line short: a dirty row would
+        # append "| N with uncommitted work" to the summary, which is a
+        # different (footer) budget than the columns under test here.
+        return [
+            renderable(repo="wings", ahead=1, stashes=2),
+            renderable(repo="roost", last_ts=1),
+        ]
+
+    def test_40_columns_sheds_the_stated_columns_and_never_overflows(self):
+        out = git_roost.render(self.rows(), width=40, expand_quiet=True)
+        header = out[0]
+        for gone in ("STASH", "BRANCH", "TREE", "DRIFT"):
+            self.assertNotIn(gone, header)
+        for kept in ("REPO", "WORK", "LAST", "SUBJECT"):
+            self.assertIn(kept, header)
+        # Nothing writes into the last column. COLOR is off in the test
+        # process, so len() is the visible length.
+        for line in out:
+            self.assertLessEqual(len(line), 40, repr(line))
+
+    def test_intermediate_width_sheds_in_order_keeping_drift(self):
+        # 55 columns is enough to keep DRIFT, the last column on the shed
+        # list -- so STASH, BRANCH and TREE must go before it does.
+        header = git_roost.render(self.rows(), width=55, expand_quiet=True)[0]
+        self.assertIn("DRIFT", header)
+        for gone in ("STASH", "BRANCH", "TREE"):
+            self.assertNotIn(gone, header)
+
+    def test_a_wide_render_keeps_every_column(self):
+        header = git_roost.render(self.rows(), width=200, expand_quiet=True)[0]
+        for h in ("REPO", "TREE", "BRANCH", "WORK", "DRIFT", "STASH", "LAST",
+                  "SUBJECT"):
+            self.assertIn(h, header)
+
+
 if __name__ == "__main__":
     unittest.main()
