@@ -18,6 +18,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -769,6 +770,76 @@ class TestWatchResize(unittest.TestCase):
                         set())
                 self.assertTrue(buf.getvalue())
                 self.assertEqual(len(shown), 2)
+
+
+class TestTtyFrameSizeChange(unittest.TestCase):
+    """The in-place no-flicker overwrite is only sound at an unchanged size.
+
+    Across a size change the terminal has rewrapped the previous frame at the
+    new width, so overwriting row-by-row misaligns: fragments of old wrapped
+    lines and rows outside the freshly painted region survive. write_tty_frame
+    must erase the display once on any shape change (drag repaints and the
+    settled paint both funnel through it), and must NOT erase on a same-size
+    paint -- the full-screen erase every frame is exactly what made watch mode
+    flash before the overwrite path existed.
+    """
+
+    def setUp(self):
+        # Each test starts as watch mode does: no previously painted frame.
+        git_roost._LAST_TTY_SIZE[0] = None
+
+    def paint(self, width, height, lines):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            git_roost.write_tty_frame(width, height, lines)
+        return buf.getvalue()
+
+    def test_size_change_emits_a_full_clear(self):
+        self.paint(160, 24, ["a", "b"])
+        out = self.paint(120, 20, ["a", "b"])
+        self.assertIn("\033[2J", out)
+
+    def test_same_size_repaint_stays_flicker_free(self):
+        self.paint(160, 24, ["a", "b"])
+        out = self.paint(160, 24, ["c", "d"])
+        self.assertNotIn("\033[2J", out,
+                         "a same-size repaint erased the display; that "
+                         "full-buffer flash is what the overwrite path "
+                         "exists to prevent")
+
+    def test_first_paint_of_a_session_starts_from_a_clear(self):
+        # The alternate-screen entry resets the tracker, so the first frame
+        # never trusts leftovers from a previous session's shape.
+        out = self.paint(160, 24, ["a"])
+        self.assertIn("\033[2J", out)
+
+    def test_shrink_leaves_no_stale_trailing_rows(self):
+        # Paint tall, then shrink. The clear must come before any row is
+        # written, and no cursor address in the new frame may reach past the
+        # new height -- together those leave nothing of the tall frame alive.
+        self.paint(100, 30, ["row %d" % i for i in range(30)])
+        out = self.paint(100, 10, ["row %d" % i for i in range(5)])
+        clear_at = out.find("\033[2J")
+        self.assertNotEqual(clear_at, -1)
+        first_row = out.find("\033[1;1H")
+        self.assertNotEqual(first_row, -1)
+        self.assertLess(clear_at, first_row)
+        addressed = [int(m) for m in
+                     re.findall(r"\033\[(\d+);1H", out)]
+        self.assertEqual(max(addressed), 10)
+        # Every row of the shorter frame is written (blank rows padded and
+        # cleared), so nothing below row 5 relies on the old frame either.
+        self.assertEqual(sorted(addressed), list(range(1, 11)))
+
+    def test_drag_and_settled_paints_share_the_clearing_path(self):
+        # A drag burst then the settled size: the first paint of each new
+        # shape clears, and a repeat of the settled shape does not.
+        outs = [self.paint(w, h, ["x"]) for w, h in
+                ((150, 24), (130, 22), (120, 20), (120, 20))]
+        self.assertIn("\033[2J", outs[0])
+        self.assertIn("\033[2J", outs[1])
+        self.assertIn("\033[2J", outs[2])
+        self.assertNotIn("\033[2J", outs[3])
 
 
 class TestSortModes(unittest.TestCase):

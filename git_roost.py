@@ -904,17 +904,38 @@ def clip_to_height(lines, height, focus=0):
     return [header] + window + [footer]
 
 
+# (width, height) of the frame write_tty_frame last painted. The in-place
+# overwrite below is only sound while the terminal still shows that frame at
+# that shape; a size change makes the terminal rewrap it, and overwriting the
+# rewrapped mess row-by-row misaligns (stale fragments survive wherever the
+# old frame wrapped or extended past the new one). One slot, not a dict: there
+# is exactly one screen.
+_LAST_TTY_SIZE = [None]
+
+
 def write_tty_frame(width, height, lines):
     """Overwrite the visible screen in place.
 
-    `\033[2J` (erase display) is what made watch mode flash: the whole
-    buffer went black between paints. Home the cursor, write each row, and
-    clear to end-of-line so a shorter replacement does not leave junk. No
-    newlines -- a newline on the last row would scroll.
+    `\033[2J` (erase display) on every paint is what made watch mode flash:
+    the whole buffer went black between paints. So the steady state is: home
+    the cursor, write each row, and clear to end-of-line so a shorter
+    replacement does not leave junk. No newlines -- a newline on the last row
+    would scroll.
+
+    The one time `\033[2J` is right is a size change. The terminal has
+    rewrapped the previous frame at the new width, so in-place overwriting is
+    painting over a layout that no longer matches: wrapped fragments of old
+    long lines persist, and rows the rewrap pushed around survive outside the
+    freshly painted region. Erase everything once, then paint -- that single
+    clear is invisible under the drag repaint that immediately follows it,
+    and same-size paints (the flicker-sensitive common case) never pay it.
     """
     rows = list(lines[:height])
     while len(rows) < height:
         rows.append("")
+    if _LAST_TTY_SIZE[0] != (width, height):
+        sys.stdout.write("\033[2J")
+        _LAST_TTY_SIZE[0] = (width, height)
     sys.stdout.write("\033[H")
     for i, row in enumerate(rows):
         sys.stdout.write("\033[%d;1H%s\033[K" % (i + 1, row))
@@ -2395,6 +2416,9 @@ def main(argv=None):
             # sitting above the fold.
             sys.stdout.write("\033[?1049h\033[?25l")
             sys.stdout.flush()
+            # A fresh alternate screen shows none of the last session's
+            # frame; forget its size so the first paint starts from a clear.
+            _LAST_TTY_SIZE[0] = None
         with Keys() as keys:
             shown = []
             changed = set()
