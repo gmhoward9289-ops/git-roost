@@ -1656,11 +1656,14 @@ class Keys:
 # not be zero.
 WATCH_POLL = 0.25
 # Windows Terminal reports a stream of intermediate sizes during a drag.
-# settle_resize waits for two identical consecutive reads (RESIZE_SETTLE
-# apart) before repainting, and gives up waiting after RESIZE_SETTLE_MAX so a
-# long slow drag still sees the table track it.
+# settle_resize reads the size every RESIZE_SETTLE and treats two identical
+# consecutive reads as "the drag stopped". While the drag is still moving it
+# repaints live -- from cached data, throttled to at most one paint per
+# RESIZE_REPAINT -- and it returns after RESIZE_SETTLE_MAX regardless, so the
+# watch loop gets control back (and paints) even mid-drag.
 RESIZE_SETTLE = 0.05
 RESIZE_SETTLE_MAX = 0.30
+RESIZE_REPAINT = 0.12
 
 
 def next_watch_event(keys, deadline, size, get_size=None, clock=None):
@@ -1689,25 +1692,36 @@ def next_watch_event(keys, deadline, size, get_size=None, clock=None):
             return ("resize", cur)
 
 
-def settle_resize(size, get_size=None, sleep=None):
-    """Let a resize burst finish before the repaint.
+def settle_resize(size, repaint=None, get_size=None, sleep=None, clock=None):
+    """Ride out a resize drag, repainting live as it goes.
 
-    A drag emits dozens of sizes; repainting each one would chase the mouse.
-    Wait until two consecutive reads agree (or RESIZE_SETTLE_MAX passes,
-    whichever is first) so one paint lands at the final shape. Returns the
-    settled size. No git runs here -- this is purely about when to repaint
-    what is already known.
+    A drag emits dozens of sizes. Repainting every one would chase the
+    mouse, but painting nothing until it stops leaves the terminal rewrapping
+    a stale frame -- the screen looks jumbled for the whole drag. So: while
+    the size keeps changing, call `repaint(cur)` at most once per
+    RESIZE_REPAINT so the table tracks the drag, and return as soon as two
+    consecutive reads agree (the caller lands the final paint at the settled
+    size). RESIZE_SETTLE_MAX still bounds one visit: a drag longer than that
+    hands control back to the watch loop, which paints and immediately
+    re-enters on the next resize event. `repaint` must be pure
+    relayout+repaint of cached data -- no git runs here.
     """
     get_size = get_size or shutil.get_terminal_size
     sleep = sleep or time.sleep
-    deadline = time.time() + RESIZE_SETTLE_MAX
+    clock = clock or time.time
+    deadline = clock() + RESIZE_SETTLE_MAX
     cur = size
-    while time.time() < deadline:
+    last_paint = clock()
+    while clock() < deadline:
         sleep(RESIZE_SETTLE)
         nxt = get_size((160, 24))
         if (nxt.columns, nxt.lines) == (cur.columns, cur.lines):
             break
         cur = nxt
+        now = clock()
+        if repaint is not None and now - last_paint >= RESIZE_REPAINT:
+            repaint(cur)
+            last_paint = now
     return cur
 
 
@@ -2470,9 +2484,17 @@ def main(argv=None):
                 event, payload = next_watch_event(keys, deadline, size)
                 if event == "resize":
                     # Relayout + repaint of cached data only; the scan stays
-                    # on its own clock. settle_resize coalesces the burst a
-                    # drag emits so one paint lands at the final size.
-                    settle_resize(payload)
+                    # on its own clock. settle_resize repaints live (throttled)
+                    # while the drag is still moving, and the loop top lands
+                    # the final paint once the size settles.
+                    def drag_repaint(cur):
+                        w = cur.columns
+                        h = max(8, cur.lines)
+                        view["page"] = max(1, h - 4)
+                        draw_watch_frame(ansi, w, h, view, args, helping,
+                                         last_states, changed)
+                    settle_resize(
+                        payload, repaint=drag_repaint if ansi else None)
                     continue
                 if event == "tick":
                     scan_now = True

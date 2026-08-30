@@ -630,15 +630,114 @@ class TestWatchResize(unittest.TestCase):
             get_size=lambda fallback: os.terminal_size((160, 24)))
         self.assertEqual(event, ("key", "j"))
 
-    def test_settle_resize_coalesces_a_drag_burst(self):
+    def test_settle_resize_answers_with_the_final_shape(self):
         # Windows Terminal streams intermediate sizes during a drag; the
-        # settle loop must ride it out and answer with the final shape.
+        # settle loop must ride it out and answer with the final shape so
+        # the caller lands the last paint at the settled size.
         sizes = iter([os.terminal_size((150, 24)), os.terminal_size((120, 20)),
                       os.terminal_size((120, 20))])
         settled = git_roost.settle_resize(
             os.terminal_size((160, 24)),
             get_size=lambda fallback: next(sizes), sleep=lambda s: None)
         self.assertEqual(settled, os.terminal_size((120, 20)))
+
+    def test_drag_repaints_live_while_the_size_keeps_changing(self):
+        # The old settle-then-paint policy left the screen jumbled for the
+        # whole drag. Now a moving drag calls repaint() mid-flight with the
+        # current size, before the size ever settles.
+        burst = [os.terminal_size((150 - 5 * i, 24)) for i in range(4)]
+        burst += [os.terminal_size((120, 20)), os.terminal_size((120, 20))]
+        sizes = iter(burst)
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+
+        paints = []
+        settled = git_roost.settle_resize(
+            os.terminal_size((160, 24)),
+            repaint=lambda cur: paints.append((cur, now[0])),
+            get_size=lambda fallback: next(sizes),
+            sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(settled, os.terminal_size((120, 20)))
+        # At least one paint happened while the drag was still moving, at an
+        # intermediate size -- not just the final settled one.
+        self.assertTrue(paints)
+        self.assertNotEqual(paints[0][0], os.terminal_size((120, 20)))
+
+    def test_drag_repaints_are_throttled(self):
+        # A drag emits a size roughly every RESIZE_SETTLE; painting each one
+        # would chase the mouse. Consecutive mid-drag paints must be at
+        # least RESIZE_REPAINT apart, and a drag that outlives
+        # RESIZE_SETTLE_MAX must still hand control back to the loop.
+        def endless(fallback):
+            endless.n += 1
+            return os.terminal_size((200 + endless.n, 24))
+        endless.n = 0
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+
+        paints = []
+        git_roost.settle_resize(
+            os.terminal_size((160, 24)),
+            repaint=lambda cur: paints.append(now[0]),
+            get_size=endless, sleep=sleep, clock=lambda: now[0])
+        # It returned (RESIZE_SETTLE_MAX cap) even though the size never
+        # settled, and it painted along the way.
+        self.assertTrue(paints)
+        for earlier, later in zip(paints, paints[1:]):
+            self.assertGreaterEqual(later - earlier,
+                                    git_roost.RESIZE_REPAINT)
+        self.assertLessEqual(now[0],
+                             git_roost.RESIZE_SETTLE_MAX
+                             + git_roost.RESIZE_SETTLE)
+
+    def test_drag_repaint_runs_no_subprocess(self):
+        # Mid-drag paints are the same cached-relayout path as the settled
+        # paint: never git, never gh, even while the burst is still moving.
+        burst = [os.terminal_size((150, 30)), os.terminal_size((110, 26)),
+                 os.terminal_size((100, 24)), os.terminal_size((100, 24))]
+        sizes = iter(burst)
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+
+        states = [renderable(repo="alpha", last_ts=1)]
+        view = {"sort": "recent", "filter": "all", "quiet": True,
+                "log": False, "log_limit": 25, "cursor": 0, "detail": None,
+                "github": False, "note": None, "page": 10}
+
+        class Args:
+            json = False
+            legacy_json = False
+            github = False
+            watch = 3.0
+
+        def boom(*a, **kw):
+            raise AssertionError("drag repaint ran a subprocess")
+
+        paints = []
+
+        def repaint(cur):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.draw_watch_frame(
+                    True, cur.columns, max(8, cur.lines), view, Args(),
+                    False, states, set())
+            paints.append(buf.getvalue())
+
+        with mock.patch.object(git_roost.subprocess, "run", boom), \
+                mock.patch.object(git_roost.subprocess, "Popen", boom):
+            settled = git_roost.settle_resize(
+                os.terminal_size((160, 24)), repaint=repaint,
+                get_size=lambda fallback: next(sizes),
+                sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(settled, os.terminal_size((100, 24)))
+        self.assertTrue(paints)
+        self.assertTrue(all(paints))
 
     def test_resize_repaint_runs_no_subprocess(self):
         # The point of the scan/repaint split: rendering a frame at a new
