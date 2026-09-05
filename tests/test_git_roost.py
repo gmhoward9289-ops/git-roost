@@ -18,6 +18,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -630,15 +631,215 @@ class TestWatchResize(unittest.TestCase):
             get_size=lambda fallback: os.terminal_size((160, 24)))
         self.assertEqual(event, ("key", "j"))
 
-    def test_settle_resize_coalesces_a_drag_burst(self):
+    def test_size_is_checked_before_the_wait(self):
+        # When settle_resize hands a still-moving drag back, the terminal has
+        # usually moved again already. The check must come before the slice,
+        # or every cap return costs a WATCH_POLL of stale screen.
+        class NoWait:
+            enabled = False
+
+            def wait(self, timeout):
+                raise AssertionError("waited a slice with a resize pending")
+
+        event = git_roost.next_watch_event(
+            NoWait(), deadline=time.time() + 3600,
+            size=os.terminal_size((160, 24)),
+            get_size=lambda fallback: os.terminal_size((150, 24)))
+        self.assertEqual(event, ("resize", os.terminal_size((150, 24))))
+
+    def test_watch_poll_is_shorter_than_the_repaint_cadence(self):
+        # The idle slice is also the gap between a cap return and the next
+        # mid-drag paint; longer than the cadence is a visible stutter.
+        self.assertLess(git_roost.WATCH_POLL, git_roost.RESIZE_REPAINT)
+        # And the settle read divides the cadence, so mid-drag paints land
+        # every RESIZE_REPAINT rather than rounding up to the next read.
+        ratio = git_roost.RESIZE_REPAINT / git_roost.RESIZE_SETTLE
+        self.assertAlmostEqual(ratio, round(ratio), places=6)
+
+    def test_first_drag_paint_is_immediate(self):
+        # The size handed in is already known to differ from the screen, so
+        # the entry paint happens at once -- not after a full RESIZE_REPAINT.
+        sizes = iter([os.terminal_size((150, 24)), os.terminal_size((150, 24))])
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+
+        paints = []
+        git_roost.settle_resize(
+            os.terminal_size((150, 24)),
+            repaint=lambda cur: paints.append((cur, now[0])),
+            get_size=lambda fallback: next(sizes),
+            sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(paints, [(os.terminal_size((150, 24)), 0.0)])
+
+    def test_long_drag_paints_on_a_steady_cadence(self):
+        # Loop-level contract: next_watch_event and settle_resize composed
+        # the way the watch loop composes them, over a two-second drag whose
+        # size moves every 30ms. Every gap between paints must be at most one
+        # RESIZE_REPAINT, no paint may repeat the shape of the one before it
+        # (the loop skips the settled paint when the drag already landed it),
+        # and the paint count must be in the steady-cadence band rather than
+        # the burst-then-stall pattern this replaces.
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        def sleep(s):
+            now[0] += s
+
+        def get_size(fallback):
+            return os.terminal_size((100 + int(now[0] / 0.03), 24))
+
+        class Keys:
+            enabled = False
+
+            def wait(self, timeout):
+                now[0] += timeout
+                return None
+
+        paints = []
+        painted = None
+        while now[0] < 2.0:
+            size = get_size(None)
+            if painted != (size.columns, size.lines):
+                paints.append((now[0], size))          # the loop-top paint
+            painted = None
+            event, payload = git_roost.next_watch_event(
+                Keys(), deadline=now[0] + 3600, size=size,
+                get_size=get_size, clock=clock)
+            self.assertEqual(event, "resize")
+            last = [None]
+
+            def repaint(cur):
+                paints.append((now[0], cur))
+                last[0] = (cur.columns, cur.lines)
+
+            git_roost.settle_resize(payload, repaint=repaint,
+                                    get_size=get_size, sleep=sleep,
+                                    clock=clock)
+            painted = last[0]
+
+        times = [t for t, _ in paints]
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertLessEqual(max(gaps), git_roost.RESIZE_REPAINT + 1e-9,
+                             gaps)
+        for (_, a), (_, b) in zip(paints, paints[1:]):
+            self.assertNotEqual(a, b)
+        # ~2s at 100-120ms per paint: 16-20 paints. Under 14 is a stall,
+        # over 40 is chasing the mouse.
+        self.assertGreaterEqual(len(paints), 14, len(paints))
+        self.assertLessEqual(len(paints), 40, len(paints))
+
+    def test_settle_resize_answers_with_the_final_shape(self):
         # Windows Terminal streams intermediate sizes during a drag; the
-        # settle loop must ride it out and answer with the final shape.
+        # settle loop must ride it out and answer with the final shape so
+        # the caller lands the last paint at the settled size.
         sizes = iter([os.terminal_size((150, 24)), os.terminal_size((120, 20)),
                       os.terminal_size((120, 20))])
         settled = git_roost.settle_resize(
             os.terminal_size((160, 24)),
             get_size=lambda fallback: next(sizes), sleep=lambda s: None)
         self.assertEqual(settled, os.terminal_size((120, 20)))
+
+    def test_drag_repaints_live_while_the_size_keeps_changing(self):
+        # The old settle-then-paint policy left the screen jumbled for the
+        # whole drag. Now a moving drag calls repaint() mid-flight with the
+        # current size, before the size ever settles.
+        burst = [os.terminal_size((150 - 5 * i, 24)) for i in range(4)]
+        burst += [os.terminal_size((120, 20)), os.terminal_size((120, 20))]
+        sizes = iter(burst)
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+
+        paints = []
+        settled = git_roost.settle_resize(
+            os.terminal_size((160, 24)),
+            repaint=lambda cur: paints.append((cur, now[0])),
+            get_size=lambda fallback: next(sizes),
+            sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(settled, os.terminal_size((120, 20)))
+        # At least one paint happened while the drag was still moving, at an
+        # intermediate size -- not just the final settled one.
+        self.assertTrue(paints)
+        self.assertNotEqual(paints[0][0], os.terminal_size((120, 20)))
+
+    def test_drag_repaints_are_throttled(self):
+        # A drag emits a size roughly every RESIZE_SETTLE; painting each one
+        # would chase the mouse. Consecutive mid-drag paints must be at
+        # least RESIZE_REPAINT apart, and a drag that outlives
+        # RESIZE_SETTLE_MAX must still hand control back to the loop.
+        def endless(fallback):
+            endless.n += 1
+            return os.terminal_size((200 + endless.n, 24))
+        endless.n = 0
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+
+        paints = []
+        git_roost.settle_resize(
+            os.terminal_size((160, 24)),
+            repaint=lambda cur: paints.append(now[0]),
+            get_size=endless, sleep=sleep, clock=lambda: now[0])
+        # It returned (RESIZE_SETTLE_MAX cap) even though the size never
+        # settled, and it painted along the way.
+        self.assertTrue(paints)
+        for earlier, later in zip(paints, paints[1:]):
+            self.assertGreaterEqual(later - earlier,
+                                    git_roost.RESIZE_REPAINT)
+        self.assertLessEqual(now[0],
+                             git_roost.RESIZE_SETTLE_MAX
+                             + git_roost.RESIZE_SETTLE)
+
+    def test_drag_repaint_runs_no_subprocess(self):
+        # Mid-drag paints are the same cached-relayout path as the settled
+        # paint: never git, never gh, even while the burst is still moving.
+        burst = [os.terminal_size((150, 30)), os.terminal_size((110, 26)),
+                 os.terminal_size((100, 24)), os.terminal_size((100, 24))]
+        sizes = iter(burst)
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+
+        states = [renderable(repo="alpha", last_ts=1)]
+        view = {"sort": "recent", "filter": "all", "quiet": True,
+                "log": False, "log_limit": 25, "cursor": 0, "detail": None,
+                "github": False, "note": None, "page": 10}
+
+        class Args:
+            json = False
+            legacy_json = False
+            github = False
+            watch = 3.0
+
+        def boom(*a, **kw):
+            raise AssertionError("drag repaint ran a subprocess")
+
+        paints = []
+
+        def repaint(cur):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                git_roost.draw_watch_frame(
+                    True, cur.columns, max(8, cur.lines), view, Args(),
+                    False, states, set())
+            paints.append(buf.getvalue())
+
+        with mock.patch.object(git_roost.subprocess, "run", boom), \
+                mock.patch.object(git_roost.subprocess, "Popen", boom):
+            settled = git_roost.settle_resize(
+                os.terminal_size((160, 24)), repaint=repaint,
+                get_size=lambda fallback: next(sizes),
+                sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(settled, os.terminal_size((100, 24)))
+        self.assertTrue(paints)
+        self.assertTrue(all(paints))
 
     def test_resize_repaint_runs_no_subprocess(self):
         # The point of the scan/repaint split: rendering a frame at a new
@@ -670,6 +871,76 @@ class TestWatchResize(unittest.TestCase):
                         set())
                 self.assertTrue(buf.getvalue())
                 self.assertEqual(len(shown), 2)
+
+
+class TestTtyFrameSizeChange(unittest.TestCase):
+    """The in-place no-flicker overwrite is only sound at an unchanged size.
+
+    Across a size change the terminal has rewrapped the previous frame at the
+    new width, so overwriting row-by-row misaligns: fragments of old wrapped
+    lines and rows outside the freshly painted region survive. write_tty_frame
+    must erase the display once on any shape change (drag repaints and the
+    settled paint both funnel through it), and must NOT erase on a same-size
+    paint -- the full-screen erase every frame is exactly what made watch mode
+    flash before the overwrite path existed.
+    """
+
+    def setUp(self):
+        # Each test starts as watch mode does: no previously painted frame.
+        git_roost._LAST_TTY_SIZE[0] = None
+
+    def paint(self, width, height, lines):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            git_roost.write_tty_frame(width, height, lines)
+        return buf.getvalue()
+
+    def test_size_change_emits_a_full_clear(self):
+        self.paint(160, 24, ["a", "b"])
+        out = self.paint(120, 20, ["a", "b"])
+        self.assertIn("\033[2J", out)
+
+    def test_same_size_repaint_stays_flicker_free(self):
+        self.paint(160, 24, ["a", "b"])
+        out = self.paint(160, 24, ["c", "d"])
+        self.assertNotIn("\033[2J", out,
+                         "a same-size repaint erased the display; that "
+                         "full-buffer flash is what the overwrite path "
+                         "exists to prevent")
+
+    def test_first_paint_of_a_session_starts_from_a_clear(self):
+        # The alternate-screen entry resets the tracker, so the first frame
+        # never trusts leftovers from a previous session's shape.
+        out = self.paint(160, 24, ["a"])
+        self.assertIn("\033[2J", out)
+
+    def test_shrink_leaves_no_stale_trailing_rows(self):
+        # Paint tall, then shrink. The clear must come before any row is
+        # written, and no cursor address in the new frame may reach past the
+        # new height -- together those leave nothing of the tall frame alive.
+        self.paint(100, 30, ["row %d" % i for i in range(30)])
+        out = self.paint(100, 10, ["row %d" % i for i in range(5)])
+        clear_at = out.find("\033[2J")
+        self.assertNotEqual(clear_at, -1)
+        first_row = out.find("\033[1;1H")
+        self.assertNotEqual(first_row, -1)
+        self.assertLess(clear_at, first_row)
+        addressed = [int(m) for m in
+                     re.findall(r"\033\[(\d+);1H", out)]
+        self.assertEqual(max(addressed), 10)
+        # Every row of the shorter frame is written (blank rows padded and
+        # cleared), so nothing below row 5 relies on the old frame either.
+        self.assertEqual(sorted(addressed), list(range(1, 11)))
+
+    def test_drag_and_settled_paints_share_the_clearing_path(self):
+        # A drag burst then the settled size: the first paint of each new
+        # shape clears, and a repeat of the settled shape does not.
+        outs = [self.paint(w, h, ["x"]) for w, h in
+                ((150, 24), (130, 22), (120, 20), (120, 20))]
+        self.assertIn("\033[2J", outs[0])
+        self.assertIn("\033[2J", outs[1])
+        self.assertIn("\033[2J", outs[2])
+        self.assertNotIn("\033[2J", outs[3])
 
 
 class TestSortModes(unittest.TestCase):
@@ -2142,6 +2413,290 @@ class TestNarrowRender(unittest.TestCase):
         for h in ("REPO", "TREE", "BRANCH", "WORK", "DRIFT", "STASH", "LAST",
                   "SUBJECT"):
             self.assertIn(h, header)
+
+
+class TestUnicodeDialect(unittest.TestCase):
+    """The Unicode glyph tier: probed once at startup, watch-mode only.
+
+    Two dialects, one vocabulary -- the semantics of every slot are identical,
+    only the codepoints differ, and a frame must never mix them. Pipe-safe
+    output (--once, --json, anything non-interactive) is always the ASCII
+    dialect: every other test in this file runs on the module default and
+    asserts those exact bytes, which is itself the byte-identity guarantee.
+    """
+
+    def setUp(self):
+        self._color, self._ident = git_roost.COLOR, git_roost.IDENT
+
+    def tearDown(self):
+        # The dialect is module state; a test that switched it must not leak
+        # Unicode into the ASCII assertions the rest of the file makes. The
+        # main()-driving tests below also resolve COLOR/IDENT for a fake
+        # TTY; those are module state too.
+        git_roost.set_dialect(False)
+        git_roost.COLOR, git_roost.IDENT = self._color, self._ident
+
+    @staticmethod
+    def stream(tty=True, encoding="utf-8"):
+        s = mock.Mock()
+        s.isatty.return_value = tty
+        s.encoding = encoding
+        return s
+
+    # ------------------------------------------------------------- the probe
+
+    def test_probe_accepts_an_interactive_utf8_stdout_on_posix(self):
+        # A POSIX terminal reports its real locale encoding, so utf-8 on a
+        # TTY is the honest signal there -- in every spelling Python uses.
+        for enc in ("utf-8", "UTF-8", "utf8", "utf_8"):
+            self.assertTrue(git_roost.unicode_capable(
+                stream=self.stream(encoding=enc), env={}, platform="linux"),
+                enc)
+        self.assertTrue(git_roost.unicode_capable(
+            stream=self.stream(), env={}, platform="darwin"))
+
+    def test_probe_rejects_a_non_utf8_posix_terminal(self):
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(encoding="latin-1"), env={}, platform="linux"))
+
+    def test_probe_rejects_a_windows_console_outside_windows_terminal(self):
+        # Since PEP 528 every Windows console stream reports utf-8 no matter
+        # what code page the window is on, so the encoding cannot tell a
+        # legacy conhost (boxes for arrows) from Windows Terminal. Without
+        # WT_SESSION the answer on Windows is ASCII, utf-8 or not.
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(encoding="utf-8"), env={}, platform="win32"))
+
+    def test_probe_accepts_windows_terminal(self):
+        # Windows Terminal always sets WT_SESSION and always renders the tier.
+        self.assertTrue(git_roost.unicode_capable(
+            stream=self.stream(encoding="utf-8"),
+            env={"WT_SESSION": "3c1a"}, platform="win32"))
+        # ...but it still has to be a UTF-8 stream, WT_SESSION or not.
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(encoding="cp1252"),
+            env={"WT_SESSION": "3c1a"}, platform="win32"))
+
+    def test_probe_rejects_a_pipe_even_when_utf8(self):
+        for platform in ("linux", "win32"):
+            self.assertFalse(git_roost.unicode_capable(
+                stream=self.stream(tty=False), env={"WT_SESSION": "3c1a"},
+                platform=platform), platform)
+
+    def test_probe_env_override_forces_ascii(self):
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(), env={"GIT_ROOST_ASCII": "1"},
+            platform="linux"))
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(),
+            env={"GIT_ROOST_ASCII": "1", "WT_SESSION": "3c1a"},
+            platform="win32"))
+
+    def test_probe_defaults_to_the_running_platform(self):
+        # No `platform` argument means sys.platform -- the production call.
+        with mock.patch.object(git_roost.sys, "platform", "win32"):
+            self.assertFalse(git_roost.unicode_capable(
+                stream=self.stream(), env={}))
+            self.assertTrue(git_roost.unicode_capable(
+                stream=self.stream(), env={"WT_SESSION": "x"}))
+        with mock.patch.object(git_roost.sys, "platform", "linux"):
+            self.assertTrue(git_roost.unicode_capable(
+                stream=self.stream(), env={}))
+
+    def test_non_watch_main_always_resets_to_ascii(self):
+        # A leaked Unicode table from an earlier watch session in the same
+        # process must not reach one-shot output: main() sets the dialect on
+        # every path, and non-watch paths set it to ASCII unconditionally.
+        git_roost.set_dialect(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+                git_roost.main(["--once", "--root", tmp])
+        self.assertIs(git_roost.G, git_roost.ASCII_GLYPHS)
+        self.assertTrue(all(ord(ch) < 128 for ch in buf.getvalue()))
+
+    def test_check_on_an_interactive_terminal_stays_ascii(self):
+        # --check is a scripted gate, and a hook runs it on whatever terminal
+        # the shell has. It used to inherit --watch's default and pass the
+        # dialect gate, so a diverged tree printed `↑1↓1` into a hook's log.
+        # Force every probe to say yes; the gate must still say ASCII.
+        git_roost.set_dialect(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(io.StringIO()), \
+                 mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(git_roost, "enable_windows_ansi",
+                                   return_value=True), \
+                 mock.patch.object(git_roost, "unicode_capable",
+                                   return_value=True):
+                rc = git_roost.main(["--check", "--root", tmp])
+        self.assertEqual(rc, 0)
+        self.assertIs(git_roost.G, git_roost.ASCII_GLYPHS)
+        self.assertIn("clean", buf.getvalue())
+        self.assertTrue(all(ord(ch) < 128 for ch in buf.getvalue()))
+
+    def test_watch_on_a_capable_terminal_picks_unicode(self):
+        # The positive half of the gate, so the --check case above is proved
+        # to be the gate saying no rather than the probe never saying yes.
+        # The gate runs before the loop; the loop's first act is scan(), so
+        # a fake scan records the dialect and bails out via the loop's own
+        # Ctrl-C exit path -- no subprocess, no terminal.
+        seen = []
+
+        def fake_scan(args, on_progress=None):
+            seen.append(git_roost.G)
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with redirect_stdout(io.StringIO()), \
+                 redirect_stderr(io.StringIO()), \
+                 mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(git_roost, "enable_windows_ansi",
+                                   return_value=True), \
+                 mock.patch.object(git_roost, "unicode_capable",
+                                   return_value=True), \
+                 mock.patch.object(git_roost, "scan", fake_scan):
+                git_roost.main(["-w", "1", "--root", tmp])
+        self.assertEqual(seen, [git_roost.UNICODE_GLYPHS])
+
+    @needs_git
+    def test_oneshot_output_carries_no_unicode_even_from_a_utf8_stdout(self):
+        # The dialect is watch-only: even on a box whose stdout would pass the
+        # probe, a piped/one-shot render is byte-identical ASCII.
+        git_roost.set_dialect(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            make_repo(Path(tmp) / "r")
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+                git_roost.main(["--once", "--root", tmp, "--no-color"])
+            out = buf.getvalue()
+        self.assertIn("r", out)
+        self.assertTrue(all(ord(ch) < 128 for ch in out), repr(out))
+
+    # ------------------------------------------------------ glyphs per dialect
+
+    def test_drift_cell_in_both_dialects(self):
+        st = {"base": "origin/main", "ahead": 2, "behind": 3}
+        self.assertEqual(git_roost.drift(st), "^2v3")
+        git_roost.set_dialect(True)
+        self.assertEqual(git_roost.drift(st), "↑2↓3")  # up-2 down-3
+        # `=` and `-` are already both dialects' spelling.
+        self.assertEqual(git_roost.drift(
+            {"base": "origin/main", "ahead": 0, "behind": 0}), "=")
+        self.assertEqual(git_roost.drift({"base": "", "ahead": None}), "-")
+
+    def test_github_cell_in_both_dialects(self):
+        cases = {"success": ("+", "✓"), "failure": ("x", "✗"),
+                 "pending": ("~", "○")}
+        for ci, (a_mark, u_mark) in cases.items():
+            s = {"pr_number": 7, "pr_draft": False, "pr_ci": ci}
+            git_roost.set_dialect(False)
+            self.assertEqual(git_roost.github_cell(s), "#7" + a_mark)
+            git_roost.set_dialect(True)
+            self.assertEqual(git_roost.github_cell(s), "#7" + u_mark)
+
+    def test_work_cell_stays_ascii_in_the_unicode_dialect(self):
+        # The WORK cell is the pipe-safe git vocabulary shared across the
+        # flock -- identical in both dialects by design.
+        git_roost.set_dialect(True)
+        cell = git_roost.work(state(tracked=12, untracked=3))
+        self.assertEqual(cell, "12+3?")
+
+    def test_truncation_marker_in_both_dialects(self):
+        lines = ["head"] + ["row %d" % i for i in range(30)] + ["summary"]
+        out = git_roost.clip_to_height(lines, 6, focus=1)
+        self.assertIn("... ", "\n".join(out))
+        git_roost.set_dialect(True)
+        out = git_roost.clip_to_height(lines, 6, focus=1)
+        joined = "\n".join(out)
+        self.assertIn("… ", joined)          # ellipsis + N more
+        self.assertIn("more below  (j)", joined)  # still key-named
+        self.assertNotIn("...", joined)           # no mixed frames
+
+    def test_elide_uses_the_dialect_mark(self):
+        self.assertEqual(git_roost.elide("abcdefgh", 6), "abc...")
+        self.assertEqual(git_roost.elide("abc", 6), "abc")
+        git_roost.set_dialect(True)
+        self.assertEqual(git_roost.elide("abcdefgh", 6), "abcde…")
+
+    def test_elide_name_keeps_both_ends_in_unicode(self):
+        name = "wings/standardization-a1b2"
+        self.assertEqual(git_roost.elide_name(name, 12), name[:12])
+        git_roost.set_dialect(True)
+        out = git_roost.elide_name(name, 12)
+        self.assertEqual(len(out), 12)
+        self.assertTrue(out.startswith("wings/"))
+        self.assertTrue(out.endswith("a1b2"))
+        self.assertIn("…", out)
+        # A fitting name is untouched in both dialects.
+        self.assertEqual(git_roost.elide_name("short", 12), "short")
+
+    def test_ascii_safe_strips_data_but_not_dialect_glyphs(self):
+        # Commit subjects stay stripped in both dialects -- prose is unvetted
+        # -- but the active table's own glyphs must survive.
+        git_roost.set_dialect(True)
+        self.assertEqual(git_roost.ascii_safe("a—b"), "a?b")
+        marks = "↑2↓3 … ✓✗○"
+        self.assertEqual(git_roost.ascii_safe(marks), marks)
+        git_roost.set_dialect(False)
+        self.assertEqual(git_roost.ascii_safe("↑…"), "??")
+
+    # -------------------------------------------------------------- the frame
+
+    def test_overlay_frame_is_a_noop_in_ascii(self):
+        lines = ["KEYS", "", "  q   quit"]
+        self.assertEqual(git_roost.overlay_frame(lines, "help", 80, None), lines)
+
+    def test_detail_overlay_is_framed_in_unicode(self):
+        git_roost.set_dialect(True)
+        st = renderable(repo="wings", tree="t")
+        with mock.patch.object(git_roost, "git", return_value=None):
+            out = git_roost.detail_lines(st, width=60, height=20)
+        self.assertTrue(out[0].startswith("╭─ DETAIL ─"))
+        self.assertTrue(out[0].endswith("╮"))
+        self.assertTrue(out[-1].startswith("╰"))
+        self.assertTrue(out[-1].endswith("╯"))
+        for line in out[1:-1]:
+            self.assertTrue(line.startswith("│ "), repr(line))
+            self.assertTrue(line.endswith(" │"), repr(line))
+        # Every row paints the same visible width -- a ragged right border is
+        # the classic len()-vs-visible-length bug.
+        widths = {git_roost.visible_len(line) for line in out}
+        self.assertEqual(len(widths), 1, widths)
+
+    def test_detail_overlay_is_flat_in_ascii(self):
+        st = renderable(repo="wings", tree="t")
+        with mock.patch.object(git_roost, "git", return_value=None):
+            out = git_roost.detail_lines(st, width=60, height=20)
+        self.assertTrue(all(ord(ch) < 128 for ch in "\n".join(out)))
+        self.assertNotIn("╭", out[0])
+
+    def test_help_overlay_is_framed_in_unicode_and_unmixed(self):
+        git_roost.set_dialect(True)
+        out = git_roost.overlay_frame(git_roost.help_lines(), "help", 80, 40)
+        self.assertTrue(out[0].startswith("╭─ HELP ─"))
+        joined = "\n".join(out)
+        # The DRIFT legend speaks the dialect on screen -- describing `^2`
+        # under a table that renders an up-arrow would be a mixed frame.
+        self.assertIn("↑2", joined)
+        self.assertNotIn("^2", joined)
+
+    def test_help_legend_is_ascii_in_ascii(self):
+        out = "\n".join(git_roost.help_lines())
+        self.assertIn("^2", out)
+        self.assertTrue(all(ord(ch) < 128 for ch in out))
+
+    def test_frame_respects_the_height_budget(self):
+        git_roost.set_dialect(True)
+        lines = ["title"] + ["row %d" % i for i in range(50)] + ["foot"]
+        out = git_roost.overlay_frame(lines, "detail", 60, 12)
+        self.assertLessEqual(len(out), 12)
+
+    def test_frame_never_writes_into_the_last_column(self):
+        git_roost.set_dialect(True)
+        out = git_roost.overlay_frame(["x" * 200], "detail", 60, 10)
+        for line in out:
+            self.assertLessEqual(git_roost.visible_len(line), 59, repr(line))
 
 
 if __name__ == "__main__":

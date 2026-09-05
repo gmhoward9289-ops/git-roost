@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import shutil
 import sys
@@ -185,16 +186,186 @@ def paint_over(text, *codes):
     return arm + text.replace(RESET, RESET + arm) + RESET
 
 
+# ---------------------------------------------------------------- dialects
+#
+# Two glyph dialects, one vocabulary (the flock design language): every slot
+# means the same thing in both, only the codepoints differ. ASCII is the
+# default and *always* the dialect of pipe-safe output -- --once, --json,
+# anything non-interactive stays byte-identical to what it always printed.
+# The Unicode tier is chosen once at startup, only for watch mode, only when
+# the terminal's own stdout encoding says it can render it. A frame must
+# never mix dialects, which is why every glyph comes from the active table
+# rather than being spelled inline.
+#
+# The WORK cell (`12+3?`) is deliberately absent from the table: that is the
+# pipe-safe git vocabulary shared across the flock, identical in both
+# dialects.
+ASCII_GLYPHS = {
+    "up": "^", "down": "v",
+    "ok": "+", "fail": "x", "pending": "~",
+    "ellipsis": "...",
+    "frame": False,
+}
+UNICODE_GLYPHS = {
+    "up": "↑", "down": "↓",          # ↑ ↓
+    "ok": "✓", "fail": "✗",          # ✓ ✗
+    "pending": "○",                       # ○
+    "ellipsis": "…",                      # …
+    "frame": True,
+}
+
+# The active table. Module default is ASCII so headless callers -- tests,
+# --json, `git-roost | less` -- never see a Unicode byte without asking.
+G = ASCII_GLYPHS
+
+# Every character the Unicode table can emit, so ascii_safe() can let the
+# dialect's own glyphs through while still stripping unrenderable *data*.
+_UNICODE_GLYPH_CHARS = frozenset(
+    ch for v in UNICODE_GLYPHS.values() if isinstance(v, str) for ch in v
+) | frozenset("╭╮╰╯─│")  # ╭ ╮ ╰ ╯ ─ │
+
+
+def unicode_capable(stream=None, env=None, platform=None):
+    """Whether the interactive terminal can render the Unicode dialect.
+
+    Three conditions, all required: stdout is a TTY, its encoding is UTF-8,
+    and -- on Windows only -- WT_SESSION is set. The encoding alone is not
+    enough there: since PEP 528 (Python 3.6) every Windows *console* stream
+    reports utf-8 regardless of the active code page, because Python writes
+    it through WriteConsoleW. So a legacy conhost window with a raster font
+    passes the encoding check and then draws the arrows as boxes. Windows
+    Terminal always sets WT_SESSION and always renders the tier; nothing
+    else on Windows is trusted. POSIX terminals report their real locale
+    encoding, so the encoding check is the honest signal there.
+    GIT_ROOST_ASCII forces the fallback, same GIT_ROOST_* convention as every
+    other knob here. `platform` is injectable for the tests.
+    """
+    env = os.environ if env is None else env
+    if env.get("GIT_ROOST_ASCII"):
+        return False
+    stream = sys.stdout if stream is None else stream
+    try:
+        if not stream.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    enc = (getattr(stream, "encoding", "") or "").lower()
+    if not enc.replace("-", "").replace("_", "").startswith("utf"):
+        return False
+    platform = sys.platform if platform is None else platform
+    if platform == "win32" and not env.get("WT_SESSION"):
+        return False
+    return True
+
+
+def set_dialect(unicode_ok):
+    """Hold the probe's answer for the whole session -- chosen once, at startup."""
+    global G
+    G = UNICODE_GLYPHS if unicode_ok else ASCII_GLYPHS
+
+
+def elide(text, width):
+    """Truncate with the active dialect's elision mark."""
+    if len(text) <= width:
+        return text
+    mark = G["ellipsis"]
+    return text[: max(0, width - len(mark))] + mark
+
+
+def elide_name(text, width):
+    """Truncate a repo/tree/branch name.
+
+    ASCII keeps the plain head slice it always had. The Unicode dialect keeps
+    both ends (the leghorn elision rule): the tail is what distinguishes
+    `repo/branch` from `repo`, so `wings…tion-a1b2` beats `wings-standard…`.
+    """
+    if len(text) <= width:
+        return text
+    if not G["frame"]:
+        return text[:width]
+    mark = G["ellipsis"]
+    keep = max(1, width - len(mark))
+    head = (keep + 1) // 2
+    tail = keep - head
+    return text[:head] + mark + (text[-tail:] if tail else "")
+
+
+_ANSI_RE = re.compile("\033\\[[0-9;]*m")
+
+
+def visible_len(s):
+    """Length as the terminal will paint it -- len() counts SGR escapes too."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def clip_visible(s, width):
+    """Clip to a visible width, copying escapes through and re-resetting."""
+    if visible_len(s) <= width:
+        return s
+    out = []
+    vis = 0
+    i = 0
+    saw_escape = False
+    while i < len(s) and vis < width:
+        m = _ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            saw_escape = True
+            i = m.end()
+            continue
+        out.append(s[i])
+        vis += 1
+        i += 1
+    if saw_escape:
+        out.append(RESET)
+    return "".join(out)
+
+
+def overlay_frame(lines, title, width, height=None):
+    """Frame a bounded overlay (detail, help) per the active dialect.
+
+    The Unicode dialect draws the flock's rounded box (`╭─ DETAIL ─…`),
+    chrome cyan, bold uppercase title inset two columns -- an overlay is a
+    bounded region, which is exactly where a frame belongs; the main fleet
+    table stays flat in both dialects. ASCII keeps today's frameless render
+    byte-for-byte: the charter's fallback slot for a frame is the bold
+    uppercase title the overlay body already opens with.
+    """
+    if not G["frame"]:
+        return clip_to_height(lines, height, 0)
+    # Never write into the last column: a glyph there wraps onto the next row.
+    w = max(20, width - 1)
+    inner_w = w - 4
+    inner_h = None if height is None else max(1, height - 2)
+    body = clip_to_height(lines, inner_h, 0)
+    label = " %s " % title.upper()
+    label = label[: max(0, w - 6)]
+    top = (c("╭─", CYAN)
+           + c(label, CYAN, BOLD)
+           + c("─" * max(0, w - 3 - len(label)) + "╮", CYAN))
+    out = [top]
+    for line in body:
+        clipped = clip_visible(line, inner_w)
+        pad = " " * max(0, inner_w - visible_len(clipped))
+        out.append(c("│ ", CYAN) + clipped + pad + c(" │", CYAN))
+    out.append(c("╰" + "─" * (w - 2) + "╯", CYAN))
+    return out
+
+
 def ascii_safe(s):
     """Drop characters the console cannot render.
 
     Commit subjects are free-form prose and routinely carry em dashes and smart
     quotes; the Windows console codepage turns those into replacement blobs
-    mid-table.
+    mid-table. Data is stripped in both dialects -- prose is unvetted, the
+    glyph tables are not -- but the active dialect's own glyphs pass through,
+    so a subject that already went through elision keeps its `…`.
     """
     if not s:
         return ""
-    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in s)
+    keep = _UNICODE_GLYPH_CHARS if G["frame"] else frozenset()
+    return "".join(
+        ch if 32 <= ord(ch) < 127 or ch in keep else "?" for ch in s)
 
 
 def enable_windows_ansi():
@@ -681,13 +852,19 @@ def work(st):
 
 
 def drift(st):
-    """Position against the base branch: '=', '^2', 'v3', '^2v3', or '-'."""
+    """Position against the base branch: '=', '^2', 'v3', '^2v3', or '-'.
+
+    The ahead/behind marks come from the active dialect table -- `↑2↓3` in
+    the Unicode tier, byte-identical `^2v3` everywhere ASCII holds. `=` and
+    `-` are already both dialects' spelling.
+    """
     if not st["base"] or st["ahead"] is None:
         return "-"
     ahead, behind = st["ahead"], st["behind"]
     if not ahead and not behind:
         return "="
-    return ("^%d" % ahead if ahead else "") + ("v%d" % behind if behind else "")
+    return ((G["up"] + "%d" % ahead if ahead else "")
+            + (G["down"] + "%d" % behind if behind else ""))
 
 
 # Sort cycles *within* a group, never across one. The group order is the whole
@@ -898,23 +1075,44 @@ def clip_to_height(lines, height, focus=0):
     # must name the way to the rest as loudly as anything else asking for a
     # human -- the key names stay, they are the remedy.
     if above and window:
-        window[0] = c("  ... %d more above  (k)" % above, YELLOW)
+        window[0] = c("  %s %d more above  (k)" % (G["ellipsis"], above), YELLOW)
     if below and window:
-        window[-1] = c("  ... %d more below  (j)" % below, YELLOW)
+        window[-1] = c("  %s %d more below  (j)" % (G["ellipsis"], below), YELLOW)
     return [header] + window + [footer]
+
+
+# (width, height) of the frame write_tty_frame last painted. The in-place
+# overwrite below is only sound while the terminal still shows that frame at
+# that shape; a size change makes the terminal rewrap it, and overwriting the
+# rewrapped mess row-by-row misaligns (stale fragments survive wherever the
+# old frame wrapped or extended past the new one). One slot, not a dict: there
+# is exactly one screen.
+_LAST_TTY_SIZE = [None]
 
 
 def write_tty_frame(width, height, lines):
     """Overwrite the visible screen in place.
 
-    `\033[2J` (erase display) is what made watch mode flash: the whole
-    buffer went black between paints. Home the cursor, write each row, and
-    clear to end-of-line so a shorter replacement does not leave junk. No
-    newlines -- a newline on the last row would scroll.
+    `\033[2J` (erase display) on every paint is what made watch mode flash:
+    the whole buffer went black between paints. So the steady state is: home
+    the cursor, write each row, and clear to end-of-line so a shorter
+    replacement does not leave junk. No newlines -- a newline on the last row
+    would scroll.
+
+    The one time `\033[2J` is right is a size change. The terminal has
+    rewrapped the previous frame at the new width, so in-place overwriting is
+    painting over a layout that no longer matches: wrapped fragments of old
+    long lines persist, and rows the rewrap pushed around survive outside the
+    freshly painted region. Erase everything once, then paint -- that single
+    clear is invisible under the drag repaint that immediately follows it,
+    and same-size paints (the flicker-sensitive common case) never pay it.
     """
     rows = list(lines[:height])
     while len(rows) < height:
         rows.append("")
+    if _LAST_TTY_SIZE[0] != (width, height):
+        sys.stdout.write("\033[2J")
+        _LAST_TTY_SIZE[0] = (width, height)
     sys.stdout.write("\033[H")
     for i, row in enumerate(rows):
         sys.stdout.write("\033[%d;1H%s\033[K" % (i + 1, row))
@@ -932,18 +1130,17 @@ def render_pending(paths, ordered, width=160, height=None):
     for path, st in zip(paths, ordered):
         name = Path(path).name
         if st:
-            subject = ascii_safe(st.get("last_subject") or "")
-            if len(subject) > 40:
-                subject = subject[:37] + "..."
+            subject = elide(ascii_safe(st.get("last_subject") or ""), 40)
             lines.append("  %s  %s  %s  %s  %s" % (
-                st["repo"][:24].ljust(24),
-                st["tree"][:24].ljust(24),
+                elide_name(st["repo"], 24).ljust(24),
+                elide_name(st["tree"], 24).ljust(24),
                 work(st).ljust(5),
                 drift(st).ljust(5),
                 subject,
             ))
         else:
-            lines.append(c("  %s  %s" % (name[:24].ljust(24), "..."), DIM))
+            lines.append(c("  %s  %s" % (elide_name(name, 24).ljust(24),
+                                         G["ellipsis"]), DIM))
     done = sum(1 for s in ordered if s)
     lines.append("")
     lines.append("%d of %d tree(s) scanned" % (done, len(paths)))
@@ -1022,8 +1219,7 @@ def render(states, width=160, expand_quiet=False, sort_mode="recent", filt="all"
             if st["conflicts"]:
                 subject += ", %d conflict(s)" % st["conflicts"]
             subject += " **"
-        if len(subject) > subject_w:
-            subject = subject[: subject_w - 3] + "..."
+        subject = elide(subject, subject_w)
         body_cells = [row[i].ljust(widths[i]) for i in range(len(columns))]
         is_changed = bool(changed) and st["path"] in changed
         is_cursor = cursor is not None and row_i == cursor
@@ -1180,9 +1376,7 @@ def render_log(states, limit, width=160, height=None):
         "SHA".ljust(7), "AUTHOR".ljust(w_author), "SUBJECT",
     )), BOLD)]
     for r in merged:
-        subject = ascii_safe(r["subject"])
-        if len(subject) > subject_w:
-            subject = subject[: subject_w - 3] + "..."
+        subject = elide(ascii_safe(r["subject"]), subject_w)
         lines.append("  ".join((
             dur(now - r["ts"]).ljust(4),
             r["repo"].ljust(w_repo),
@@ -1247,7 +1441,8 @@ def detail_lines(st, width=160, height=None):
             for dl in diff_lines[:30]:
                 lines.append("  " + ascii_safe(dl))
             if len(diff_lines) > 30:
-                lines.append(c("  ... %d more line(s)" % (len(diff_lines) - 30),
+                lines.append(c("  %s %d more line(s)"
+                               % (G["ellipsis"], len(diff_lines) - 30),
                                YELLOW))
     lines.append("")
 
@@ -1263,7 +1458,9 @@ def detail_lines(st, width=160, height=None):
                 ascii_safe(r["subject"])))
     lines.append("")
     lines.append(c("any other key returns to the table", DIM))
-    return clip_to_height(lines, height, 0)
+    # The one bounded region on the board gets the dialect's frame; the ASCII
+    # dialect returns exactly the clipped lines this always returned.
+    return overlay_frame(lines, "detail", width, height)
 
 
 # ---------------------------------------------------------------- github (gh)
@@ -1444,17 +1641,20 @@ def github_cell(s):
     """PR column: '#123', '#123+' success, '#123x' failure, '#123~' pending,
     '#123 draft', or blank when there is no open PR.
 
-    ASCII on purpose, not the checkmark/cross this might otherwise reach for --
-    ascii_safe() exists a few hundred lines up because the Windows console
-    codepage mangles exactly that kind of glyph mid-table, and this column
-    should not need its own escape hatch from the same problem.
+    The CI mark comes from the active dialect table: `✓`/`✗`/`○` in the
+    Unicode tier, and the `+`/`x`/`~` this column has always printed
+    everywhere ASCII holds -- which is every pipe-safe surface, because the
+    dialect is only ever switched for an interactive watch session whose
+    terminal probed UTF-8-capable. The Windows-codepage mangling that kept
+    this column ASCII-only is that legacy console, and it fails the probe.
     """
     n = s.get("pr_number")
     if not n:
         return ""
     if s.get("pr_draft"):
         return "#%d draft" % n
-    mark = {"success": "+", "failure": "x", "pending": "~"}.get(s.get("pr_ci"), "")
+    mark = {"success": G["ok"], "failure": G["fail"],
+            "pending": G["pending"]}.get(s.get("pr_ci"), "")
     return "#%d%s" % (n, mark)
 
 
@@ -1509,7 +1709,10 @@ DISPLAY_HELP = (
     ("ACTIVE", "committed within the last hour"),
     ("QUIET", "in sync and idle; collapsed to one line unless expanded (a)"),
     ("WORK", "tracked changes, +N? untracked (12+3? = 12 tracked, 3 untracked)"),
-    ("DRIFT", "vs base: = in sync, ^2 ahead, v3 behind, ^2v3 diverged, - unknown"),
+    # %(up)s / %(down)s: the drift marks are dialect glyphs, and a help view
+    # describing `^2` while the table renders `↑2` would be a mixed frame.
+    ("DRIFT", "vs base: = in sync, %(up)s2 ahead, %(down)s3 behind, "
+              "%(up)s2%(down)s3 diverged, - unknown"),
     ("STASH", "stash count for the repo"),
     ("@sha", "detached HEAD; commits here land on no branch"),
     ("*", "row changed since the last frame   >  cursor row"),
@@ -1653,27 +1856,38 @@ class Keys:
 # How often the watch loop checks the terminal shape while it waits for a key
 # or the next scan tick. A resize repaints (cached data, no git) within this
 # window, so it must be small; it is also the idle wake-up rate, so it must
-# not be zero.
-WATCH_POLL = 0.25
+# not be zero. It must also stay under RESIZE_REPAINT: when settle_resize
+# hands a still-moving drag back to the loop, this slice is the gap before
+# the next mid-drag paint, and a slice longer than the repaint cadence is a
+# visible stutter every RESIZE_SETTLE_MAX.
+WATCH_POLL = 0.10
 # Windows Terminal reports a stream of intermediate sizes during a drag.
-# settle_resize waits for two identical consecutive reads (RESIZE_SETTLE
-# apart) before repainting, and gives up waiting after RESIZE_SETTLE_MAX so a
-# long slow drag still sees the table track it.
-RESIZE_SETTLE = 0.05
+# settle_resize reads the size every RESIZE_SETTLE and treats two identical
+# consecutive reads as "the drag stopped". While the drag is still moving it
+# repaints live -- from cached data, throttled to at most one paint per
+# RESIZE_REPAINT -- and it returns after RESIZE_SETTLE_MAX regardless, so the
+# watch loop gets control back even mid-drag. RESIZE_SETTLE divides
+# RESIZE_REPAINT exactly so the mid-drag cadence is a steady 120ms rather
+# than the 150ms a 50ms read would round it up to.
+RESIZE_SETTLE = 0.06
 RESIZE_SETTLE_MAX = 0.30
+RESIZE_REPAINT = 0.12
 
 
 def next_watch_event(keys, deadline, size, get_size=None, clock=None):
     """Block until the watch loop owes a frame, and say why.
 
     Returns ("key", ch), ("resize", new_size) or ("tick", None). The wait
-    happens in WATCH_POLL slices with a terminal-size check between them, so
-    a resize triggers a repaint of the already-scanned fleet within a
+    happens in WATCH_POLL slices with a terminal-size check before each one,
+    so a resize triggers a repaint of the already-scanned fleet within a
     fraction of a second -- scanning stays on its own clock (`deadline`,
     which is last scan + interval). This is the reason a resize is cheap:
     the answer to "the terminal changed shape" is relayout + repaint, never
-    a rescan. get_size/clock are injectable for the tests; the loop passes
-    neither.
+    a rescan. The size check comes *before* the wait, not after: when
+    settle_resize returns mid-drag the terminal has usually moved again
+    already, and checking first turns that into an immediate resize event
+    instead of one delayed by a whole slice. get_size/clock are injectable
+    for the tests; the loop passes neither.
     """
     get_size = get_size or shutil.get_terminal_size
     clock = clock or time.time
@@ -1681,33 +1895,54 @@ def next_watch_event(keys, deadline, size, get_size=None, clock=None):
         remaining = deadline - clock()
         if remaining <= 0:
             return ("tick", None)
-        key = keys.wait(min(WATCH_POLL, remaining))
-        if key is not None:
-            return ("key", key)
         cur = get_size((160, 24))
         if (cur.columns, cur.lines) != (size.columns, size.lines):
             return ("resize", cur)
+        key = keys.wait(min(WATCH_POLL, remaining))
+        if key is not None:
+            return ("key", key)
 
 
-def settle_resize(size, get_size=None, sleep=None):
-    """Let a resize burst finish before the repaint.
+def settle_resize(size, repaint=None, get_size=None, sleep=None, clock=None):
+    """Ride out a resize drag, repainting live as it goes.
 
-    A drag emits dozens of sizes; repainting each one would chase the mouse.
-    Wait until two consecutive reads agree (or RESIZE_SETTLE_MAX passes,
-    whichever is first) so one paint lands at the final shape. Returns the
-    settled size. No git runs here -- this is purely about when to repaint
-    what is already known.
+    A drag emits dozens of sizes. Repainting every one would chase the
+    mouse, but painting nothing until it stops leaves the terminal rewrapping
+    a stale frame -- the screen looks jumbled for the whole drag. So: paint
+    `size` immediately on entry (it is already known to differ from what is
+    on screen -- that is why we were called), then while the size keeps
+    changing call `repaint(cur)` at most once per RESIZE_REPAINT so the table
+    tracks the drag, and return as soon as two consecutive reads agree.
+    RESIZE_SETTLE_MAX still bounds one visit: a drag longer than that hands
+    control back to the watch loop, which re-enters on the very next resize
+    event (next_watch_event checks the size before it waits), so a long drag
+    paints on a steady cadence rather than in bursts.
+
+    Returns the last size read. The caller can tell whether that shape is
+    already on screen by comparing it with the last size it handed to
+    `repaint` -- the watch loop does exactly that to skip a duplicate paint
+    when the drag's final mid-flight paint happened to land on the settled
+    shape. `repaint` must be pure relayout+repaint of cached data -- no git
+    runs here.
     """
     get_size = get_size or shutil.get_terminal_size
     sleep = sleep or time.sleep
-    deadline = time.time() + RESIZE_SETTLE_MAX
+    clock = clock or time.time
+    deadline = clock() + RESIZE_SETTLE_MAX
     cur = size
-    while time.time() < deadline:
+    if repaint is not None:
+        repaint(cur)
+    last_paint = clock()
+    while clock() < deadline:
         sleep(RESIZE_SETTLE)
         nxt = get_size((160, 24))
         if (nxt.columns, nxt.lines) == (cur.columns, cur.lines):
             break
         cur = nxt
+        now = clock()
+        if repaint is not None and now - last_paint >= RESIZE_REPAINT:
+            repaint(cur)
+            last_paint = now
     return cur
 
 
@@ -1720,7 +1955,9 @@ def help_lines():
     # ignoring them -- so the overlay reads the same way the table does.
     d_width = max(len(k) for k, _ in DISPLAY_HELP)
     out += ["", c("READING THE TABLE", BOLD), ""]
-    out += ["  %s   %s" % (c(k.ljust(d_width), BOLD), desc)
+    out += ["  %s   %s" % (c(k.ljust(d_width), BOLD),
+                           desc % {"up": G["up"], "down": G["down"]}
+                           if "%(" in desc else desc)
             for k, desc in DISPLAY_HELP]
     out += ["", c("any other key returns to the table", DIM)]
     return out
@@ -1921,7 +2158,7 @@ def draw_watch_frame(ansi, width, height, view, args, helping, states,
         out = [json_document(states, getattr(args, "legacy_json", False))]
         shown = []
     elif helping:
-        out = clip_to_height(help_lines(), body_h, 0)
+        out = overlay_frame(help_lines(), "help", width, body_h)
         shown = visible_rows(states, view["quiet"], view["sort"], view["filter"])
     elif pending is not None:
         paths, ordered = pending
@@ -2154,6 +2391,11 @@ def build_parser():
                     help="with --json, emit the bare pre-0.6 list of records "
                          "instead of the envelope")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
+    ap.add_argument("--ascii", action="store_true",
+                    help="force the ASCII glyph dialect in watch mode (the "
+                         "Unicode tier is otherwise used when stdout is an "
+                         "interactive UTF-8 terminal; GIT_ROOST_ASCII=1 does "
+                         "the same. Pipe-safe output is always ASCII)")
     ap.add_argument("--github", action="store_true",
                     help="add a PR/CI column via `gh` (opt-in: network calls, "
                          "needs gh on PATH and authenticated; silently omitted "
@@ -2239,6 +2481,7 @@ _arguments -S \\
   '--fail-on[exit 1 on this condition]:condition:(none dirty diverged stuck)' \\
   '--json[emit records as JSON]' \\
   '--no-color[disable colour output]' \\
+  '--ascii[force the ASCII glyph dialect in watch mode]' \\
   '--github[add a PR/CI column via gh]' \\
   '--github-interval[PR/CI refresh interval in watch mode]:seconds:' \\
   '--print-completion[print a shell completion script]:shell:(bash zsh powershell)'
@@ -2285,11 +2528,14 @@ def main(argv=None):
         sys.stdout.write(print_completion(args.print_completion))
         return 0
 
-    # TUI is the default on a real terminal. Scripts, pipes, --once and --json
-    # stay one-shot so `git-roost | less` and the test harness never hang in
-    # the watch loop. Clearing watch keeps scan()'s oneshot progress check
-    # honest -- it keys off args.watch being unset.
-    if args.once or args.json or not sys.stdout.isatty():
+    # TUI is the default on a real terminal. Scripts, pipes, --once, --json
+    # and --check stay one-shot so `git-roost | less` and the test harness
+    # never hang in the watch loop. Clearing watch keeps scan()'s oneshot
+    # progress check honest -- it keys off args.watch being unset -- and it is
+    # also what the glyph-dialect gate below reads, so --check must be nulled
+    # here rather than merely bypassing the loop further down: a --check on an
+    # interactive terminal used to print `↑1↓1` into a hook's log.
+    if args.once or args.json or args.check or not sys.stdout.isatty():
         args.watch = None
 
     # Escape sequences need a real terminal that understands them. This gates
@@ -2305,6 +2551,18 @@ def main(argv=None):
             "git-roost: no VT console (cannot redraw in place); "
             "rendering once. Use Windows Terminal, or pass --once.\n")
         args.watch = None
+
+    # Which glyph dialect renders is the terminal's decision, probed once and
+    # held for the session -- and only an interactive watch session ever gets
+    # the Unicode tier. Every non-watch path is unconditionally ASCII: --once,
+    # --json, --check, a pipe, a non-VT console. Each of those has already
+    # nulled args.watch above, so `bool(args.watch)` is the single gate and
+    # there is no second list of exemptions here to drift out of step. That is
+    # what keeps `git-roost | less`, `--json | jq`, `--check` in a hook and
+    # every existing consumer byte-identical to what they always got. Set
+    # explicitly on both paths so a long-lived process can never leak one
+    # mode's table into the other.
+    set_dialect(bool(args.watch) and not args.ascii and unicode_capable())
 
     # NO_COLOR is the community convention (https://no-color.org) and costs
     # nothing to honour. It suppresses colour only -- a user who wants plain
@@ -2381,11 +2639,20 @@ def main(argv=None):
             # sitting above the fold.
             sys.stdout.write("\033[?1049h\033[?25l")
             sys.stdout.flush()
+            # A fresh alternate screen shows none of the last session's
+            # frame; forget its size so the first paint starts from a clear.
+            _LAST_TTY_SIZE[0] = None
         with Keys() as keys:
             shown = []
             changed = set()
             scan_now = True
             last_scan = 0.0
+            # The shape a resize drag last painted, or None. Set only by the
+            # resize branch below and consumed at the very next loop top: if
+            # the terminal is still that shape, the frame is already on
+            # screen and painting it again is a wasted (if flicker-free)
+            # rewrite of every row.
+            drag_painted = None
             while True:
                 size = shutil.get_terminal_size((160, 24))
                 width = size.columns
@@ -2393,6 +2660,9 @@ def main(argv=None):
                 # What pgup/pgdn mean this frame: the body rows the terminal
                 # can show (status line + table header + summary trimmed off).
                 view["page"] = max(1, height - 4)
+
+                already_painted = drag_painted == (size.columns, size.lines)
+                drag_painted = None
 
                 # Scanning runs git across the whole fleet; repainting is
                 # string work on the previous scan. Only the interval tick and
@@ -2428,7 +2698,12 @@ def main(argv=None):
                         args, on_progress=None if args.json else on_progress)
                     last_scan = time.time()
 
-                if args.json:
+                if already_painted:
+                    # The drag's last paint landed on the settled shape; the
+                    # screen is current and `shown` was captured by that
+                    # paint. Straight to waiting for the next event.
+                    pass
+                elif args.json:
                     shown = draw_watch_frame(
                         ansi, width, height, view, args, helping, last_states,
                         {})
@@ -2470,9 +2745,24 @@ def main(argv=None):
                 event, payload = next_watch_event(keys, deadline, size)
                 if event == "resize":
                     # Relayout + repaint of cached data only; the scan stays
-                    # on its own clock. settle_resize coalesces the burst a
-                    # drag emits so one paint lands at the final size.
-                    settle_resize(payload)
+                    # on its own clock. settle_resize repaints live (throttled)
+                    # while the drag is still moving; the loop top lands the
+                    # final paint once the size settles -- unless the last
+                    # mid-drag paint already was that shape, which the
+                    # painted-size record lets it see and skip.
+                    painted = [None]
+
+                    def drag_repaint(cur):
+                        nonlocal shown
+                        w = cur.columns
+                        h = max(8, cur.lines)
+                        view["page"] = max(1, h - 4)
+                        shown = draw_watch_frame(ansi, w, h, view, args,
+                                                 helping, last_states, changed)
+                        painted[0] = (w, cur.lines)
+                    settle_resize(
+                        payload, repaint=drag_repaint if ansi else None)
+                    drag_painted = painted[0]
                     continue
                 if event == "tick":
                     scan_now = True
