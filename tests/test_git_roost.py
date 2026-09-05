@@ -2344,24 +2344,63 @@ class TestUnicodeDialect(unittest.TestCase):
 
     # ------------------------------------------------------------- the probe
 
-    def test_probe_accepts_an_interactive_utf8_stdout(self):
+    def test_probe_accepts_an_interactive_utf8_stdout_on_posix(self):
+        # A POSIX terminal reports its real locale encoding, so utf-8 on a
+        # TTY is the honest signal there -- in every spelling Python uses.
         for enc in ("utf-8", "UTF-8", "utf8", "utf_8"):
             self.assertTrue(git_roost.unicode_capable(
-                stream=self.stream(encoding=enc), env={}), enc)
+                stream=self.stream(encoding=enc), env={}, platform="linux"),
+                enc)
+        self.assertTrue(git_roost.unicode_capable(
+            stream=self.stream(), env={}, platform="darwin"))
 
-    def test_probe_rejects_a_legacy_codepage_console(self):
-        # The historical "block drawing mojibakes on Windows" console: a TTY,
-        # but its codepage cannot render the tier.
+    def test_probe_rejects_a_non_utf8_posix_terminal(self):
         self.assertFalse(git_roost.unicode_capable(
-            stream=self.stream(encoding="cp1252"), env={}))
+            stream=self.stream(encoding="latin-1"), env={}, platform="linux"))
+
+    def test_probe_rejects_a_windows_console_outside_windows_terminal(self):
+        # Since PEP 528 every Windows console stream reports utf-8 no matter
+        # what code page the window is on, so the encoding cannot tell a
+        # legacy conhost (boxes for arrows) from Windows Terminal. Without
+        # WT_SESSION the answer on Windows is ASCII, utf-8 or not.
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(encoding="utf-8"), env={}, platform="win32"))
+
+    def test_probe_accepts_windows_terminal(self):
+        # Windows Terminal always sets WT_SESSION and always renders the tier.
+        self.assertTrue(git_roost.unicode_capable(
+            stream=self.stream(encoding="utf-8"),
+            env={"WT_SESSION": "3c1a"}, platform="win32"))
+        # ...but it still has to be a UTF-8 stream, WT_SESSION or not.
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(encoding="cp1252"),
+            env={"WT_SESSION": "3c1a"}, platform="win32"))
 
     def test_probe_rejects_a_pipe_even_when_utf8(self):
-        self.assertFalse(git_roost.unicode_capable(
-            stream=self.stream(tty=False), env={}))
+        for platform in ("linux", "win32"):
+            self.assertFalse(git_roost.unicode_capable(
+                stream=self.stream(tty=False), env={"WT_SESSION": "3c1a"},
+                platform=platform), platform)
 
     def test_probe_env_override_forces_ascii(self):
         self.assertFalse(git_roost.unicode_capable(
-            stream=self.stream(), env={"GIT_ROOST_ASCII": "1"}))
+            stream=self.stream(), env={"GIT_ROOST_ASCII": "1"},
+            platform="linux"))
+        self.assertFalse(git_roost.unicode_capable(
+            stream=self.stream(),
+            env={"GIT_ROOST_ASCII": "1", "WT_SESSION": "3c1a"},
+            platform="win32"))
+
+    def test_probe_defaults_to_the_running_platform(self):
+        # No `platform` argument means sys.platform -- the production call.
+        with mock.patch.object(git_roost.sys, "platform", "win32"):
+            self.assertFalse(git_roost.unicode_capable(
+                stream=self.stream(), env={}))
+            self.assertTrue(git_roost.unicode_capable(
+                stream=self.stream(), env={"WT_SESSION": "x"}))
+        with mock.patch.object(git_roost.sys, "platform", "linux"):
+            self.assertTrue(git_roost.unicode_capable(
+                stream=self.stream(), env={}))
 
     def test_non_watch_main_always_resets_to_ascii(self):
         # A leaked Unicode table from an earlier watch session in the same

@@ -225,13 +225,20 @@ _UNICODE_GLYPH_CHARS = frozenset(
 ) | frozenset("╭╮╰╯─│")  # ╭ ╮ ╰ ╯ ─ │
 
 
-def unicode_capable(stream=None, env=None):
+def unicode_capable(stream=None, env=None, platform=None):
     """Whether the interactive terminal can render the Unicode dialect.
 
-    The probe is the stdout encoding: a UTF-8 stream on a TTY renders the
-    tier correctly (Windows Terminal included -- the historical mojibake was
-    the legacy-codepage console, which fails this exact check). GIT_ROOST_ASCII
-    forces the fallback, same GIT_ROOST_* convention as every other knob here.
+    Three conditions, all required: stdout is a TTY, its encoding is UTF-8,
+    and -- on Windows only -- WT_SESSION is set. The encoding alone is not
+    enough there: since PEP 528 (Python 3.6) every Windows *console* stream
+    reports utf-8 regardless of the active code page, because Python writes
+    it through WriteConsoleW. So a legacy conhost window with a raster font
+    passes the encoding check and then draws the arrows as boxes. Windows
+    Terminal always sets WT_SESSION and always renders the tier; nothing
+    else on Windows is trusted. POSIX terminals report their real locale
+    encoding, so the encoding check is the honest signal there.
+    GIT_ROOST_ASCII forces the fallback, same GIT_ROOST_* convention as every
+    other knob here. `platform` is injectable for the tests.
     """
     env = os.environ if env is None else env
     if env.get("GIT_ROOST_ASCII"):
@@ -243,7 +250,12 @@ def unicode_capable(stream=None, env=None):
     except (AttributeError, ValueError):
         return False
     enc = (getattr(stream, "encoding", "") or "").lower()
-    return enc.replace("-", "").replace("_", "").startswith("utf")
+    if not enc.replace("-", "").replace("_", "").startswith("utf"):
+        return False
+    platform = sys.platform if platform is None else platform
+    if platform == "win32" and not env.get("WT_SESSION"):
+        return False
+    return True
 
 
 def set_dialect(unicode_ok):
