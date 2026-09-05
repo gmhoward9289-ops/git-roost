@@ -631,6 +631,107 @@ class TestWatchResize(unittest.TestCase):
             get_size=lambda fallback: os.terminal_size((160, 24)))
         self.assertEqual(event, ("key", "j"))
 
+    def test_size_is_checked_before_the_wait(self):
+        # When settle_resize hands a still-moving drag back, the terminal has
+        # usually moved again already. The check must come before the slice,
+        # or every cap return costs a WATCH_POLL of stale screen.
+        class NoWait:
+            enabled = False
+
+            def wait(self, timeout):
+                raise AssertionError("waited a slice with a resize pending")
+
+        event = git_roost.next_watch_event(
+            NoWait(), deadline=time.time() + 3600,
+            size=os.terminal_size((160, 24)),
+            get_size=lambda fallback: os.terminal_size((150, 24)))
+        self.assertEqual(event, ("resize", os.terminal_size((150, 24))))
+
+    def test_watch_poll_is_shorter_than_the_repaint_cadence(self):
+        # The idle slice is also the gap between a cap return and the next
+        # mid-drag paint; longer than the cadence is a visible stutter.
+        self.assertLess(git_roost.WATCH_POLL, git_roost.RESIZE_REPAINT)
+        # And the settle read divides the cadence, so mid-drag paints land
+        # every RESIZE_REPAINT rather than rounding up to the next read.
+        ratio = git_roost.RESIZE_REPAINT / git_roost.RESIZE_SETTLE
+        self.assertAlmostEqual(ratio, round(ratio), places=6)
+
+    def test_first_drag_paint_is_immediate(self):
+        # The size handed in is already known to differ from the screen, so
+        # the entry paint happens at once -- not after a full RESIZE_REPAINT.
+        sizes = iter([os.terminal_size((150, 24)), os.terminal_size((150, 24))])
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+
+        paints = []
+        git_roost.settle_resize(
+            os.terminal_size((150, 24)),
+            repaint=lambda cur: paints.append((cur, now[0])),
+            get_size=lambda fallback: next(sizes),
+            sleep=sleep, clock=lambda: now[0])
+        self.assertEqual(paints, [(os.terminal_size((150, 24)), 0.0)])
+
+    def test_long_drag_paints_on_a_steady_cadence(self):
+        # Loop-level contract: next_watch_event and settle_resize composed
+        # the way the watch loop composes them, over a two-second drag whose
+        # size moves every 30ms. Every gap between paints must be at most one
+        # RESIZE_REPAINT, no paint may repeat the shape of the one before it
+        # (the loop skips the settled paint when the drag already landed it),
+        # and the paint count must be in the steady-cadence band rather than
+        # the burst-then-stall pattern this replaces.
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        def sleep(s):
+            now[0] += s
+
+        def get_size(fallback):
+            return os.terminal_size((100 + int(now[0] / 0.03), 24))
+
+        class Keys:
+            enabled = False
+
+            def wait(self, timeout):
+                now[0] += timeout
+                return None
+
+        paints = []
+        painted = None
+        while now[0] < 2.0:
+            size = get_size(None)
+            if painted != (size.columns, size.lines):
+                paints.append((now[0], size))          # the loop-top paint
+            painted = None
+            event, payload = git_roost.next_watch_event(
+                Keys(), deadline=now[0] + 3600, size=size,
+                get_size=get_size, clock=clock)
+            self.assertEqual(event, "resize")
+            last = [None]
+
+            def repaint(cur):
+                paints.append((now[0], cur))
+                last[0] = (cur.columns, cur.lines)
+
+            git_roost.settle_resize(payload, repaint=repaint,
+                                    get_size=get_size, sleep=sleep,
+                                    clock=clock)
+            painted = last[0]
+
+        times = [t for t, _ in paints]
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertLessEqual(max(gaps), git_roost.RESIZE_REPAINT + 1e-9,
+                             gaps)
+        for (_, a), (_, b) in zip(paints, paints[1:]):
+            self.assertNotEqual(a, b)
+        # ~2s at 100-120ms per paint: 16-20 paints. Under 14 is a stall,
+        # over 40 is chasing the mouse.
+        self.assertGreaterEqual(len(paints), 14, len(paints))
+        self.assertLessEqual(len(paints), 40, len(paints))
+
     def test_settle_resize_answers_with_the_final_shape(self):
         # Windows Terminal streams intermediate sizes during a drag; the
         # settle loop must ride it out and answer with the final shape so
