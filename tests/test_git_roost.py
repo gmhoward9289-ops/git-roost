@@ -2324,10 +2324,16 @@ class TestUnicodeDialect(unittest.TestCase):
     asserts those exact bytes, which is itself the byte-identity guarantee.
     """
 
+    def setUp(self):
+        self._color, self._ident = git_roost.COLOR, git_roost.IDENT
+
     def tearDown(self):
         # The dialect is module state; a test that switched it must not leak
-        # Unicode into the ASCII assertions the rest of the file makes.
+        # Unicode into the ASCII assertions the rest of the file makes. The
+        # main()-driving tests below also resolve COLOR/IDENT for a fake
+        # TTY; those are module state too.
         git_roost.set_dialect(False)
+        git_roost.COLOR, git_roost.IDENT = self._color, self._ident
 
     @staticmethod
     def stream(tty=True, encoding="utf-8"):
@@ -2368,6 +2374,50 @@ class TestUnicodeDialect(unittest.TestCase):
                 git_roost.main(["--once", "--root", tmp])
         self.assertIs(git_roost.G, git_roost.ASCII_GLYPHS)
         self.assertTrue(all(ord(ch) < 128 for ch in buf.getvalue()))
+
+    def test_check_on_an_interactive_terminal_stays_ascii(self):
+        # --check is a scripted gate, and a hook runs it on whatever terminal
+        # the shell has. It used to inherit --watch's default and pass the
+        # dialect gate, so a diverged tree printed `↑1↓1` into a hook's log.
+        # Force every probe to say yes; the gate must still say ASCII.
+        git_roost.set_dialect(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(io.StringIO()), \
+                 mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(git_roost, "enable_windows_ansi",
+                                   return_value=True), \
+                 mock.patch.object(git_roost, "unicode_capable",
+                                   return_value=True):
+                rc = git_roost.main(["--check", "--root", tmp])
+        self.assertEqual(rc, 0)
+        self.assertIs(git_roost.G, git_roost.ASCII_GLYPHS)
+        self.assertIn("clean", buf.getvalue())
+        self.assertTrue(all(ord(ch) < 128 for ch in buf.getvalue()))
+
+    def test_watch_on_a_capable_terminal_picks_unicode(self):
+        # The positive half of the gate, so the --check case above is proved
+        # to be the gate saying no rather than the probe never saying yes.
+        # The gate runs before the loop; the loop's first act is scan(), so
+        # a fake scan records the dialect and bails out via the loop's own
+        # Ctrl-C exit path -- no subprocess, no terminal.
+        seen = []
+
+        def fake_scan(args, on_progress=None):
+            seen.append(git_roost.G)
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with redirect_stdout(io.StringIO()), \
+                 redirect_stderr(io.StringIO()), \
+                 mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(git_roost, "enable_windows_ansi",
+                                   return_value=True), \
+                 mock.patch.object(git_roost, "unicode_capable",
+                                   return_value=True), \
+                 mock.patch.object(git_roost, "scan", fake_scan):
+                git_roost.main(["-w", "1", "--root", tmp])
+        self.assertEqual(seen, [git_roost.UNICODE_GLYPHS])
 
     @needs_git
     def test_oneshot_output_carries_no_unicode_even_from_a_utf8_stdout(self):

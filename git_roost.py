@@ -2498,11 +2498,14 @@ def main(argv=None):
         sys.stdout.write(print_completion(args.print_completion))
         return 0
 
-    # TUI is the default on a real terminal. Scripts, pipes, --once and --json
-    # stay one-shot so `git-roost | less` and the test harness never hang in
-    # the watch loop. Clearing watch keeps scan()'s oneshot progress check
-    # honest -- it keys off args.watch being unset.
-    if args.once or args.json or not sys.stdout.isatty():
+    # TUI is the default on a real terminal. Scripts, pipes, --once, --json
+    # and --check stay one-shot so `git-roost | less` and the test harness
+    # never hang in the watch loop. Clearing watch keeps scan()'s oneshot
+    # progress check honest -- it keys off args.watch being unset -- and it is
+    # also what the glyph-dialect gate below reads, so --check must be nulled
+    # here rather than merely bypassing the loop further down: a --check on an
+    # interactive terminal used to print `↑1↓1` into a hook's log.
+    if args.once or args.json or args.check or not sys.stdout.isatty():
         args.watch = None
 
     # Escape sequences need a real terminal that understands them. This gates
@@ -2521,11 +2524,14 @@ def main(argv=None):
 
     # Which glyph dialect renders is the terminal's decision, probed once and
     # held for the session -- and only an interactive watch session ever gets
-    # the Unicode tier. One-shot, piped and --json output is unconditionally
-    # ASCII (args.watch is already None on every one of those paths), which is
-    # what keeps `git-roost | less`, `--json | jq` and every existing consumer
-    # byte-identical to what they always got. Set explicitly on both paths so
-    # a long-lived process can never leak one mode's table into the other.
+    # the Unicode tier. Every non-watch path is unconditionally ASCII: --once,
+    # --json, --check, a pipe, a non-VT console. Each of those has already
+    # nulled args.watch above, so `bool(args.watch)` is the single gate and
+    # there is no second list of exemptions here to drift out of step. That is
+    # what keeps `git-roost | less`, `--json | jq`, `--check` in a hook and
+    # every existing consumer byte-identical to what they always got. Set
+    # explicitly on both paths so a long-lived process can never leak one
+    # mode's table into the other.
     set_dialect(bool(args.watch) and not args.ascii and unicode_capable())
 
     # NO_COLOR is the community convention (https://no-color.org) and costs
