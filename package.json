@@ -1,6 +1,6 @@
 {
   "name": "git-roost",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "top for git -- every repo and worktree on the box, most actionable first",
   "keywords": [
     "git",
