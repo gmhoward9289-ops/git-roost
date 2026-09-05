@@ -16,11 +16,32 @@ jobs:
     # git-roost claims 3.9+ on macOS, Linux and Windows, and all three claims are
     # load-bearing. Windows especially: the ANSI/VT path and git's path handling
     # are the two things that differ, and neither is exercised by a Linux run.
+    #
+    # This is deliberately not a full os x python cross product. The
+    # interpreter is tested on Linux, where a leg costs seconds: 3.9 is the
+    # floor, 3.13 is what the Homebrew formula pins, 3.14 is what the primary
+    # dev box actually runs. The other two platforms are here to prove the
+    # platform claim, not to re-test each interpreter:
+    #
+    # - macOS gets one leg, on 3.13, because that is the python@3.13 the
+    #   formula installs -- the interpreter nearly every Mac user runs this
+    #   under. No Intel leg: pure-Python stdlib with no dependencies, so the
+    #   architecture cannot change a result.
+    # - Windows gets the floor and the ceiling, 3.9 and 3.14, because the VT
+    #   and path code is where an interpreter change would bite, and the two
+    #   ends bracket it.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
         python: ["3.9", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.9"
+          - os: windows-latest
+            python: "3.14"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -251,3 +272,29 @@ jobs:
       # next real finding along with this one.
       - name: Semgrep
         run: semgrep scan --config p/python --config p/secrets --error --metrics=off .
+
+  # The branch ruleset requires this one check instead of naming every job
+  # above. Required checks match by name, and a matrix leg's name is its
+  # parameters, so a matrix change silently strands the ruleset: this repo's
+  # never learned about the 3.14 legs, and leghorn's kept demanding
+  # "test (macos-13, ...)" long after that leg was gone, leaving every PR on
+  # "Expected -- waiting for status". This job's name never changes; what it
+  # asserts is "every job in ci.yml succeeded". The PR-title lint lives in
+  # its own workflow, so the ruleset still names it directly.
+  #
+  # `if: always()` is load-bearing. Without it a failed dependency skips this
+  # job, and a skipped required check shows as pending forever rather than
+  # failed. The jq line then does the real gating: success only, so a
+  # cancelled or skipped job fails the gate instead of slipping through as
+  # merely not-a-failure.
+  ci-ok:
+    if: always()
+    needs: [test, packaging, packaging-windows, lint, semgrep]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job in ci.yml succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS"
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' > /dev/null
