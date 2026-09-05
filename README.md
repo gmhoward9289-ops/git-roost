@@ -138,6 +138,7 @@ git-roost --repo wings --sort work --filter dirty   # scope, sort and filter tog
 git-roost --check                      # no table -- exit 1 if any tree needs a human first
 git-roost --fail-on stuck              # like --check, but keeps the normal table
 git-roost --github                     # add a PR/CI column, via `gh` (opt-in: network calls)
+git-roost --ascii                      # keep the ASCII glyphs in watch mode (see "Two glyph dialects")
 ```
 
 Watch mode takes keys:
@@ -301,11 +302,39 @@ Columns:
   Untracked files get a marker but never a group of their own: they are mostly
   scratch output, and one tree here carries a dozen permanently.
 - **DRIFT** — `=` in sync, `^2` ahead, `v3` behind, `^2v3` diverged, `-` unknown.
-  `-` means *unknown*, never *in sync*.
+  `-` means *unknown*, never *in sync*. In the Unicode dialect (below) the same
+  cell reads `↑2`, `↓3`, `↑2↓3`.
 - **STASH** — stash entries, blank when there are none.
 - **LAST** — age of the last commit.
 - **PR** — only with `--github`. `#123` open, `#123+` CI green, `#123x` CI red,
-  `#123~` CI still running, `#123 draft`, blank when there is no open PR.
+  `#123~` CI still running, `#123 draft`, blank when there is no open PR. In
+  the Unicode dialect: `#123✓`, `#123✗`, `#123○`.
+
+### Two glyph dialects
+
+Every cell means the same thing everywhere; only the codepoints differ.
+
+| Slot | ASCII | Unicode |
+|---|---|---|
+| ahead / behind | `^2` / `v3` | `↑2` / `↓3` |
+| CI green / red / running | `#123+` / `#123x` / `#123~` | `#123✓` / `#123✗` / `#123○` |
+| truncation | `...` | `…` (names keep both ends: `wings…a1b2`) |
+| `?` and `enter` overlays | flat | framed `╭─ DETAIL ─╮` |
+
+**ASCII is the default and the only dialect pipe-safe output ever uses.**
+`--once`, `--json`, `--check`, anything redirected, and any terminal without VT
+support print exactly the bytes they always printed, so `git-roost | less`,
+`--json | jq` and a `--check` in a hook are byte-identical to every earlier
+release. The `WORK` cell (`12+3?`) is ASCII in both dialects — it is the git
+vocabulary shared across the whole family.
+
+The Unicode tier is chosen once, at startup, for watch mode only, and only
+when the terminal says it can render it: stdout is an interactive UTF-8
+stream, and on Windows the session is Windows Terminal (`WT_SESSION` set — a
+legacy console reports UTF-8 too but draws the arrows as boxes). `--ascii`, or
+`GIT_ROOST_ASCII=1` in the environment, keeps the ASCII glyphs regardless. A
+frame never mixes the two: the `?` legend describes whichever dialect is on
+screen.
 
 ### Finding the baseline
 
@@ -335,6 +364,8 @@ know which is authoritative, and a confident wrong baseline is worse than `-`.
 | `GIT_ROOST_WORKERS` | `12` | how many trees are scanned in parallel |
 | `GIT_ROOST_GH_TIMEOUT` | `8` | seconds any single `gh` call may take before it is abandoned (only with `--github`) |
 | `GIT_ROOST_GH_WORKERS` | `4` | how many `gh` calls run in parallel (only with `--github`; its own, smaller pool so a slow `gh` never starves the git scan) |
+| `GIT_ROOST_ASCII` | unset | any value keeps the ASCII glyph dialect in watch mode, same as `--ascii` (pipe-safe output is always ASCII regardless) |
+| `NO_COLOR` | unset | any value disables colour ([no-color.org](https://no-color.org)); watch mode still redraws in place |
 
 No dotfile or config file, deliberately — every setting here is an env var or a
 flag, matching roost, leghorn and legbar. The timeout and worker count are both

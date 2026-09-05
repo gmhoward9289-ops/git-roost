@@ -74,6 +74,26 @@ Emit the collected records as JSON rather than a table.
 .B \-\-no\-color
 Disable colour output.
 .TP
+.B \-\-ascii
+Keep the ASCII glyph dialect in watch mode. Without it, watch mode uses the
+Unicode dialect (\fB\(ua2\fR/\fB\(da3\fR arrows for DRIFT, check marks
+for CI, framed overlays) when stdout is an interactive UTF\-8 terminal \(em on
+Windows, only under Windows Terminal (\fBWT_SESSION\fR set), since a legacy
+console reports UTF\-8 but cannot draw the glyphs. Pipe\-safe output
+(\fB\-\-once\fR, \fB\-\-json\fR, \fB\-\-check\fR, anything redirected) is
+always ASCII and needs no flag. Same as setting \fBGIT_ROOST_ASCII\fR.
+.TP
+.B \-\-check
+Print nothing but a summary and exit 1 if any tree is mid\-operation,
+diverged or has uncommitted work; 0 otherwise. For scripts and hooks, not the
+table. Always one\-shot, always ASCII.
+.TP
+.B \-\-github
+Add a PR/CI column via
+.BR gh (1).
+Opt\-in: network calls; needs \fBgh\fR on PATH and authenticated, silently
+omitted otherwise.
+.TP
 .BR \-\-print\-completion " \fISHELL\fR"
 Print a completion script for \fISHELL\fR (bash, zsh or powershell) to
 standard output and exit. Eval or source it from the shell's profile.
@@ -89,7 +109,9 @@ or both. Untracked files are marked but never promoted to the UNCOMMITTED group.
 .B DRIFT
 Position against the base branch: \fB=\fR in sync, \fB^N\fR ahead, \fBvN\fR
 behind, \fB^NvM\fR diverged, \fB\-\fR unknown. A dash means unknown, never in
-sync.
+sync. In the Unicode dialect (watch mode on a capable terminal, see
+\fB\-\-ascii\fR) the same cell is drawn with up and down arrows: U+2191 N
+ahead, U+2193 N behind.
 .IP
 The baseline is the branch's upstream if it has one, else \fBorigin/HEAD\fR,
 else \(em when the repository has exactly one remote \(em that remote's
@@ -101,6 +123,12 @@ Number of stash entries, blank when there are none.
 .TP
 .B LAST
 Age of the most recent commit.
+.TP
+.B PR
+Only with \fB\-\-github\fR. \fB#123\fR open, \fB#123+\fR CI green,
+\fB#123x\fR CI red, \fB#123~\fR CI still running, \fB#123 draft\fR, blank when
+there is no open PR. In the Unicode dialect the CI marks are U+2713 (check),
+U+2717 (cross) and U+25CB (circle) in place of \fB+\fR, \fBx\fR and \fB~\fR.
 .SH ENVIRONMENT
 .TP
 .B GIT_ROOST_ROOT
@@ -117,6 +145,14 @@ Size of the thread pool used to scan trees. Default 12.
 .TP
 .B GIT_ROOST_TIMEOUT
 Seconds before an individual git call is abandoned. Default 5.
+.TP
+.B GIT_ROOST_ASCII
+If set to any value, watch mode keeps the ASCII glyph dialect; same as
+\fB\-\-ascii\fR. Pipe\-safe output is ASCII regardless.
+.TP
+.B WT_SESSION
+Set by Windows Terminal, not by git\-roost. On Windows it is what admits the
+Unicode dialect: a legacy console reports UTF\-8 too but cannot draw it.
 .TP
 .B NO_COLOR
 If set, colour output is disabled. See https://no-color.org.
