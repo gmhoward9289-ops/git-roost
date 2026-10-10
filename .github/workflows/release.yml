@@ -435,7 +435,7 @@ jobs:
       # itself is a Windows-only tool (it shells out to msiexec/signtool-style
       # inspection of the installer it is submitting), so the action requires
       # a Windows runner regardless of what the package being submitted needs.
-      - uses: vedantmgoyal2009/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+      - uses: vedantmgoyal2009/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
         with:
           identifier: gmhoward9289-ops.git-roost
           # Only the zip is a winget installer; without this the action would
