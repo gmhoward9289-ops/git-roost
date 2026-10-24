@@ -188,7 +188,7 @@ jobs:
       # dist/ fails the run on a file PyPI was never going to accept.
       - name: Drop the .deb -- PyPI takes wheels and sdists only
         run: rm -f dist/*.deb
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
 
   # Publishes to npm as `git-roost` via trusted publishing (OIDC), the same
   # no-token pattern as the pypi job above: npmjs.com trusts this exact repo +
